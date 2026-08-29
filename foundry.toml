@@ -13,7 +13,7 @@ via_ir = false
 bytecode_hash = "none"
 cbor_metadata = false
 # Deploy script writes deployments.json after a successful broadcast.
-fs_permissions = [{ access = "write", path = "deployments.json" }, { access = "write", path = "deployments-v2.json" }, { access = "write", path = "deployments-v3.json" }]
+fs_permissions = [{ access = "write", path = "deployments.json" }, { access = "write", path = "deployments-v2.json" }, { access = "write", path = "deployments-v3.json" }, { access = "write", path = "deployments-vanity.json" }]
 
 [profile.default.fuzz]
 runs = 256
