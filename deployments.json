@@ -1,0 +1,10 @@
+{
+  "chainId": 11155111,
+  "network": "sepolia",
+  "factory": "0xF6cACF858752b46e9861E34cec2B432Fd06C3f12",
+  "factoryDeployBlock": 11519633,
+  "deployTx": "0x21fd1e5527464bf4374261d9f071f78f164fae0e712a4a32d8f902b73bba1243",
+  "feeRecipient": "0x13C5699E4Ba4C9f6BB59120c09E1098e080d97d6",
+  "platformFeeBps": 150,
+  "artifactSha256": "03de2e06d9d6e5b965c76fca049cec98fd87e189b887f246747ac6d9415639d9"
+}

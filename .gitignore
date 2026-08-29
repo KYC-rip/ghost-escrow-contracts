@@ -1,0 +1,7 @@
+node_modules/
+out/
+cache/
+broadcast/
+.env
+.DS_Store
+*.key
