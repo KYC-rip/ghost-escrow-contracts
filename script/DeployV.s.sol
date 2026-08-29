@@ -109,6 +109,20 @@ contract DeployV is Script {
         address pReg = c3.predict(ops, sReg);
         address pFac = c3.predict(ops, sFac);
 
+        // A1 (review): a wrong --private-key or a typoed salt would still pass
+        // every `address == prediction` check and deploy NON-VANITY addresses
+        // silently on mainnet — the exact divergence the scheme exists to stop.
+        // When salts are ground for a specific ops namespace, pin it; and when
+        // a salt is in use, assert its predicted address carries the signed-off
+        // suffix. Rehearsals (all-zero salts) skip both.
+        address expectedOps = vm.envOr("OPS", address(0));
+        require(expectedOps == address(0) || ops == expectedOps, "ops key != salt namespace");
+        _requireSuffix(pReg, sReg, 0x5afe, "registry");
+        _requireSuffix(pFac, sFac, 0xfac7, "factory");
+        _requireSuffix(c3.predict(ops, sCourt), sCourt, 0x5ea1, "court");
+        _requireSuffix(c3.predict(ops, sStd), sStd, 0xdea1, "stdImpl");
+        _requireSuffix(c3.predict(ops, sOpen), sOpen, 0xdea1, "openImpl");
+
         registry = ArbitratorRegistry(
             _deploy(sReg, abi.encodePacked(
                 type(ArbitratorRegistry).creationCode,
@@ -160,6 +174,13 @@ contract DeployV is Script {
         }
     }
 
+    /// @dev When `salt` is non-zero (a real ground salt, not a rehearsal), the
+    ///      predicted address MUST end in the signed-off 2-byte suffix.
+    function _requireSuffix(address predicted, bytes32 salt, uint16 suffix, string memory what) internal pure {
+        if (salt == bytes32(0)) return;
+        require(uint16(uint160(predicted)) == suffix, string.concat("vanity suffix mismatch: ", what));
+    }
+
     function _deploy(bytes32 salt, bytes memory creationCode, address predicted) internal returns (address a) {
         a = c3.deploy(salt, creationCode);
         require(a == predicted, "address != prediction");
@@ -194,7 +215,12 @@ contract DeployV is Script {
             '"platformFeeBps":', vm.toString(cfg.platformFeeBps), ",",
             '"minStake":', vm.toString(cfg.minStake), ",",
             '"highValueThreshold":', vm.toString(cfg.highValueThreshold), ",",
-            '"activationDelay":', vm.toString(cfg.activationDelay),
+            '"activationDelay":', vm.toString(cfg.activationDelay), ",",
+            '"registryCodehash":"', vm.toString(address(registry).codehash), '",',
+            '"factoryCodehash":"', vm.toString(address(factory).codehash), '",',
+            '"courtCodehash":"', vm.toString(address(court).codehash), '",',
+            '"stdImplCodehash":"', vm.toString(stdImpl.codehash), '",',
+            '"openImplCodehash":"', vm.toString(openImpl.codehash), '"',
             "}"
         );
         vm.writeFile(string.concat(vm.projectRoot(), "/deployments-vanity.json"), string.concat(head, tail));
@@ -208,6 +234,7 @@ contract DeployV is Script {
 ///        --private-key $CURATOR_KEY --broadcast
 contract AddTemplates is Script {
     function run() external {
+        require(block.chainid == vm.envUint("EXPECTED_CHAIN_ID"), "wrong chain");
         EscrowCloneFactory factory = EscrowCloneFactory(vm.envAddress("FACTORY"));
         vm.startBroadcast();
         factory.addTemplate(vm.envAddress("STD_IMPL"));

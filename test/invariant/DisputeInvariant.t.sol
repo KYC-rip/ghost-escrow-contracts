@@ -26,6 +26,9 @@ contract DisputeHandler is Test {
     uint256 internal immutable chainId;
 
     bytes32 private constant RELEASE_TYPEHASH = keccak256("Release(uint256 nonce,uint256 deadline)");
+    bytes32 private constant REPLACE_ARB_TYPEHASH =
+        keccak256("ReplaceArbitrator(address newArbitrator,uint256 nonce,uint256 deadline)");
+    address[6] public arbs; // for unbond/withdraw churn
 
     constructor(
         GhostEscrowV2CImpl[4] memory _deals,
@@ -45,6 +48,10 @@ contract DisputeHandler is Test {
         buyer = vm.addr(_buyerPk);
         seller = vm.addr(_sellerPk);
         chainId = _chainId;
+    }
+
+    function setArbs(address[6] memory _arbs) external {
+        arbs = _arbs;
     }
 
     function dealCount() external pure returns (uint256) {
@@ -156,8 +163,39 @@ contract DisputeHandler is Test {
     }
 
     function warp(uint256 secs) external {
-        vm.warp(block.timestamp + bound(secs, 1 hours, 8 days));
+        // Mostly short hops so post-warp fund/dispute stay live; a rare long
+        // warp still exercises the timeout/auto-release windows (review skew).
+        uint256 d = secs % 8 == 0 ? bound(secs, 7 days, 9 days) : bound(secs, 1 hours, 36 hours);
+        vm.warp(block.timestamp + d);
         vm.roll(block.number + 10);
+    }
+
+    function replaceArb(uint256 seed) external {
+        GhostEscrowV2CImpl e = _deal(seed);
+        address newArb = arbs[seed % 6];
+        uint256 deadline = block.timestamp + 1 hours;
+        bytes32 structHash = keccak256(abi.encode(REPLACE_ARB_TYPEHASH, newArb, e.nonce(), deadline));
+        bytes32 digest = SigUtils.digest(address(e), chainId, structHash);
+        (uint8 v1, bytes32 r1, bytes32 s1) = vm.sign(buyerPk, digest);
+        (uint8 v2, bytes32 r2, bytes32 s2) = vm.sign(sellerPk, digest);
+        try e.replaceArbitrator(newArb, deadline, abi.encodePacked(r1, s1, v1), abi.encodePacked(r2, s2, v2)) {} catch {}
+    }
+
+    function claimPot(uint256 seed) external {
+        vm.prank(_party(seed));
+        try _deal(seed).claimStrandedPot() {} catch {}
+    }
+
+    function unbond(uint256 seed, uint256 amount) external {
+        address who = arbs[seed % 6];
+        amount = bound(amount, 1, 500e6);
+        vm.prank(who);
+        try registry.requestUnbond(amount) {} catch {}
+    }
+
+    function withdrawStake(uint256 seed) external {
+        vm.prank(arbs[seed % 6]);
+        try registry.withdraw() {} catch {}
     }
 }
 
@@ -201,6 +239,7 @@ contract DisputeInvariantTest is GhostTestBaseD {
         );
 
         handler = new DisputeHandler(dealArr, registry, court, token, buyerPk, sellerPk, chainId);
+        handler.setArbs(trackedArbs);
         targetContract(address(handler));
     }
 
