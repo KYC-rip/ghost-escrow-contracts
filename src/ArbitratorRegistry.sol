@@ -114,7 +114,8 @@ contract ArbitratorRegistry is ReentrancyGuard {
         uint256 _slaDuration,
         uint256 _slaSlashBps,
         uint256 _overturnSlashBps,
-        uint256 _minStake
+        uint256 _minStake,
+        address _deployer
     ) {
         require(address(_stakingToken) != address(0), "zero token");
         require(_stakeMultiple > 0, "zero multiple");
@@ -129,7 +130,11 @@ contract ArbitratorRegistry is ReentrancyGuard {
         SLA_SLASH_BPS = _slaSlashBps;
         OVERTURN_SLASH_BPS = _overturnSlashBps;
         MIN_STAKE = _minStake;
-        deployer = msg.sender;
+        // Explicit arg, not msg.sender: under a CREATE3 deploy the constructor
+        // runs from an ephemeral proxy that can never call again — the one-shot
+        // bind gate must name the real ops key. Semantics unchanged otherwise.
+        require(_deployer != address(0), "zero deployer");
+        deployer = _deployer;
     }
 
     /// @notice One-time auth binding: the DEPLOYER (recorded at construction)

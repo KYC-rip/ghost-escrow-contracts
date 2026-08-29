@@ -16,6 +16,10 @@ import {AppealCourt} from "../src/AppealCourt.sol";
 ///      Params (defaults): STAKE_MULTIPLE=10, UNBONDING_DELAY=21d, SLA_DURATION=7d,
 ///      SLA_SLASH_BPS=1000 (10%), OVERTURN_SLASH_BPS=5000 (50% — operator decision).
 contract DeployV2 is Script {
+    function _broadcaster() internal returns (address b) {
+        (, b,) = vm.readCallers();
+    }
+
     function run() external {
         uint256 expectedChainId = vm.envOr("EXPECTED_CHAIN_ID", uint256(11155111));
         require(block.chainid == expectedChainId, "wrong chain");
@@ -32,7 +36,7 @@ contract DeployV2 is Script {
         vm.startBroadcast();
         // Legacy script (frozen templates) — MIN_STAKE=0 keeps its behavior.
         ArbitratorRegistry registry = new ArbitratorRegistry(
-            IERC20(stakingToken), stakeMultiple, unbondingDelay, slaDuration, slaSlashBps, overturnSlashBps, 0
+            IERC20(stakingToken), stakeMultiple, unbondingDelay, slaDuration, slaSlashBps, overturnSlashBps, 0, _broadcaster()
         );
         EscrowFactoryV2 factory = new EscrowFactoryV2(registry, feeRecipient, platformFeeBps);
         AppealCourt court = new AppealCourt(registry);

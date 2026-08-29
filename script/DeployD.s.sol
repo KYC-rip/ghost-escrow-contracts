@@ -59,6 +59,11 @@ contract DeployD is Script {
         });
 
         vm.startBroadcast();
+        // The broadcast wallet — NOT msg.sender, which inside a forge script is
+        // the harness default sender. Gates may be overridden per-key (A3).
+        (, address broadcaster,) = vm.readCallers();
+        address opsDeployer = vm.envOr("REGISTRY_DEPLOYER", broadcaster);
+        address curator = vm.envOr("CURATOR", broadcaster);
         registry = new ArbitratorRegistry(
             IERC20(cfg.stakingToken),
             cfg.stakeMultiple,
@@ -66,9 +71,10 @@ contract DeployD is Script {
             cfg.slaDuration,
             cfg.slaSlashBps,
             cfg.overturnSlashBps,
-            cfg.minStake
+            cfg.minStake,
+            opsDeployer
         );
-        factory = new EscrowCloneFactory(registry, cfg.feeRecipient, cfg.platformFeeBps, cfg.activationDelay);
+        factory = new EscrowCloneFactory(registry, cfg.feeRecipient, cfg.platformFeeBps, cfg.activationDelay, curator);
         court = new AppealCourt(registry);
         registry.setFactory(address(factory));
         registry.setCourt(address(court));

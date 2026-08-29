@@ -238,7 +238,7 @@ contract SecurityFixesTest is GhostTestBaseD {
 
     function test_F4_minStakeFloorEnforced() public {
         ArbitratorRegistry minReg = new ArbitratorRegistry(
-            IERC20(address(token)), STAKE_MULTIPLE, UNBONDING, SLA_DURATION, SLA_SLASH_BPS, OVERTURN_SLASH_BPS, 50e6
+            IERC20(address(token)), STAKE_MULTIPLE, UNBONDING, SLA_DURATION, SLA_SLASH_BPS, OVERTURN_SLASH_BPS, 50e6, address(this)
         );
         token.mint(stranger, 100e6);
         vm.startPrank(stranger);

@@ -58,7 +58,7 @@ abstract contract GhostTestBaseV2 is Test {
         token = new MockERC20("MockUSDC", "USDC", 6);
         // Deploy order (C-5): registry → factory → court → deployer binds both.
         registry = new ArbitratorRegistry(
-            IERC20(address(token)), STAKE_MULTIPLE, UNBONDING, SLA_DURATION, SLA_SLASH_BPS, OVERTURN_SLASH_BPS, 0
+            IERC20(address(token)), STAKE_MULTIPLE, UNBONDING, SLA_DURATION, SLA_SLASH_BPS, OVERTURN_SLASH_BPS, 0, address(this)
         );
         factoryV2 = new EscrowFactoryV2(registry, feeRecipient, FEE_BPS);
         court = new AppealCourt(registry);

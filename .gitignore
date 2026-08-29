@@ -5,3 +5,5 @@ broadcast/
 .env
 .DS_Store
 *.key
+tools/vanity-grinder
+vanity-hits.txt

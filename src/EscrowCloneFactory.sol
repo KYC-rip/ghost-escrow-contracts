@@ -82,7 +82,7 @@ contract EscrowCloneFactory {
     event CuratorRenounced(address indexed lastCurator);
     event EscrowCreated(address indexed escrow, address indexed implementation, bytes32 initDataHash);
 
-    constructor(ArbitratorRegistry _registry, address _feeRecipient, uint256 _platformFeeBps, uint256 _activationDelay) {
+    constructor(ArbitratorRegistry _registry, address _feeRecipient, uint256 _platformFeeBps, uint256 _activationDelay, address _curator) {
         require(address(_registry) != address(0), "zero registry");
         require(_feeRecipient != address(0), "zero");
         require(_platformFeeBps <= 1000, "fee too high");
@@ -90,7 +90,11 @@ contract EscrowCloneFactory {
         feeRecipient = _feeRecipient;
         platformFeeBps = _platformFeeBps;
         activationDelay = _activationDelay;
-        curator = msg.sender;
+        // Explicit arg, not msg.sender (CREATE3: constructor msg.sender is an
+        // ephemeral proxy). The curator custody model is unchanged — the arg
+        // simply names the curator key instead of inheriting the broadcaster.
+        require(_curator != address(0), "zero curator");
+        curator = _curator;
         // NOTE: the registry's factory binding is set by the REGISTRY deployer
         // after this constructor (registry.setFactory(address(this))) — never
         // from here; this factory isn't the registry's deployer.

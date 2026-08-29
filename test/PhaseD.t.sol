@@ -51,7 +51,7 @@ contract PhaseDFactoryTest is GhostTestBaseD {
 
     function test_activationTimelock_gatesCreate() public {
         // Fresh factory with a 48h delay; templates unusable until it elapses.
-        EscrowCloneFactory delayed = new EscrowCloneFactory(registry, feeRecipient, FEE_BPS, 48 hours);
+        EscrowCloneFactory delayed = new EscrowCloneFactory(registry, feeRecipient, FEE_BPS, 48 hours, address(this));
         GhostEscrowV2CImpl impl = new GhostEscrowV2CImpl(address(delayed), registry, 25_000e6);
         delayed.addTemplate(address(impl));
         _stakeArbEligible();
@@ -142,9 +142,9 @@ contract PhaseDFactoryTest is GhostTestBaseD {
     function test_initialize_enforcesCourtBound() public {
         // Fresh registry with NO court bound; fresh factory+impl on it.
         ArbitratorRegistry reg2 = new ArbitratorRegistry(
-            IERC20(address(token)), STAKE_MULTIPLE, UNBONDING, SLA_DURATION, SLA_SLASH_BPS, OVERTURN_SLASH_BPS, 0
+            IERC20(address(token)), STAKE_MULTIPLE, UNBONDING, SLA_DURATION, SLA_SLASH_BPS, OVERTURN_SLASH_BPS, 0, address(this)
         );
-        EscrowCloneFactory f2 = new EscrowCloneFactory(reg2, feeRecipient, FEE_BPS, 0);
+        EscrowCloneFactory f2 = new EscrowCloneFactory(reg2, feeRecipient, FEE_BPS, 0, address(this));
         GhostEscrowV2CImpl impl2 = new GhostEscrowV2CImpl(address(f2), reg2, 25_000e6);
         f2.addTemplate(address(impl2));
         reg2.setFactory(address(f2));

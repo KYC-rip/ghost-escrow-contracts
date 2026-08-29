@@ -66,7 +66,7 @@ contract RegistryInvariantTest is Test {
 
     function setUp() public {
         token = new MockERC20("MockUSDC", "USDC", 6);
-        registry = new ArbitratorRegistry(IERC20(address(token)), 10, 21 days, 7 days, 1000, 5000, MIN_STAKE);
+        registry = new ArbitratorRegistry(IERC20(address(token)), 10, 21 days, 7 days, 1000, 5000, MIN_STAKE, address(this));
         handler = new RegistryHandler(registry, token);
         targetContract(address(handler));
     }

@@ -1,10 +1,14 @@
 # ghost-escrow-contracts
 
 Immutable, no-admin escrow contracts for [Ghost Escrow](https://escrow.kyc.rip)
-(kyc.rip). **Unaudited** — an external review before mainnet is part of the
-launch gate; nothing deploys to production without explicit operator approval.
+(kyc.rip) — deals between strangers, funds locked by code, disputes settled by
+staked, slashable arbitrators. No owner keys, no upgrades, no admin backdoor:
+once a deal exists, nobody — including us — can change its rules.
 
-## Current version — Arbitrator Model v2 + clone factory (Phase D)
+> **Status: testnet.** These contracts run on Sepolia today. An independent
+> security review is scheduled before any mainnet deployment.
+
+## Current version — Arbitrator Model v2 + clone factory 
 
 Live on **Sepolia** (v4 triad, security batch of 2026-08-29, all sources
 [verified on Sourcify](https://sourcify.dev)):
@@ -78,8 +82,13 @@ script/     deploy scripts
 abi/        exported ABIs (npm run export:abi)
 ```
 
-## Deployment policy
+## Releases & versioning
 
-- Testnet deploys only during development (M1–M5).
-- **Mainnet: no deploy without operator approval**; external audit first; ABI +
-  addresses published via `deployments.json` after verification.
+- New template versions ship through the factory's append-only `addTemplate`,
+  behind an on-chain activation timelock (48h on mainnet) — the codehash is
+  public and diffable before any deal can use a new template.
+- Existing deals never migrate: every deal runs to completion on the exact code
+  it was created with, and superseded versions stay listed here as
+  frozen-but-valid.
+- Each release publishes addresses + codehashes in `deployments-*.json` and is
+  source-verified (Sourcify, Etherscan) before it is announced.

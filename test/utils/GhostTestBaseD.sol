@@ -134,9 +134,9 @@ abstract contract GhostTestBaseD is Test {
         // Deploy order (Phase D): registry → clone factory → court → bind both
         // → implementations(factory, registry) → addTemplate.
         registry = new ArbitratorRegistry(
-            IERC20(address(token)), STAKE_MULTIPLE, UNBONDING, SLA_DURATION, SLA_SLASH_BPS, OVERTURN_SLASH_BPS, 0
+            IERC20(address(token)), STAKE_MULTIPLE, UNBONDING, SLA_DURATION, SLA_SLASH_BPS, OVERTURN_SLASH_BPS, 0, address(this)
         );
-        factory = new EscrowCloneFactory(registry, feeRecipient, FEE_BPS, 0);
+        factory = new EscrowCloneFactory(registry, feeRecipient, FEE_BPS, 0, address(this));
         court = new AppealCourt(registry);
         registry.setFactory(address(factory));
         registry.setCourt(address(court));
