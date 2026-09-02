@@ -1,0 +1,69 @@
+{
+  "_comment": [
+    "Ground CREATE3 vanity salts for the Ghost Escrow v2 triad + templates.",
+    "Each address = Create3Factory.predict(opsDeployer, salt), which depends ONLY on",
+    "(create3Factory, opsDeployer, salt) — never on initcode — so ONE salt yields the",
+    "SAME address on every chain even when constructor args differ per chain.",
+    "INVARIANTS that make these addresses real on mainnet (see runbook):",
+    "  1. Create3Factory MUST land at create3Factory below (bootstrap key, nonce 0).",
+    "  2. DeployV MUST broadcast from opsDeployer (msg.sender = salt namespace).",
+    "  3. Create3Factory.PROXY_INITCODE_HASH() MUST equal proxyInitcodeHash below.",
+    "Any of these off => addresses silently diverge. DeployV asserts the suffix of each.",
+    "Derivation re-verified 2026-09-02 (tools/vanity-hits.txt); grinder complete."
+  ],
+  "opsDeployer": "0x4d0E5F0f2B6Fbd35E0850dBC7747306AF9Ba7D5B",
+  "create3Factory": "0xC0d740C874aD65Bb9d108769C9B9A9Ff7453033e",
+  "proxyInitcodeHash": "0x21c35dbe1b344a2488cf3321d6ce542f8e9f305544ff09e4993a62319a497c1f",
+  "contracts": {
+    "registry": {
+      "env": "SALT_REGISTRY",
+      "suffix": "0x5afe",
+      "salt": "0x023100000000000000000000000000000000000000000000b3b7588212000000",
+      "address": "0x000000aeee00daeaaa9e776db4bf451a5ece5afe",
+      "src": "ArbitratorRegistry.sol"
+    },
+    "factory": {
+      "env": "SALT_FACTORY",
+      "suffix": "0xfac7",
+      "salt": "0x069800000000000000000000000000000000000000000000f3186f0103000000",
+      "address": "0x000000d0c13fe25337697704a8a92fd854e8fac7",
+      "src": "EscrowCloneFactory.sol"
+    },
+    "court": {
+      "env": "SALT_COURT",
+      "suffix": "0x5ea1",
+      "salt": "0x00310000000000000000000000000000000000000000000035ffd7ad63000000",
+      "address": "0x0000009193e7460be143a4d86e18cce5803f5ea1",
+      "src": "AppealCourt.sol"
+    },
+    "stdImpl": {
+      "env": "SALT_STD",
+      "suffix": "0xdea1",
+      "salt": "0x023100000000000000000000000000000000000000000000fdd6d7d806000000",
+      "address": "0x0000006fa0db6f1706d236b2a18a594decb7dea1",
+      "src": "GhostEscrowV2CImpl.sol"
+    },
+    "openImpl": {
+      "env": "SALT_OPEN",
+      "suffix": "0xdea1",
+      "salt": "0x033100000000000000000000000000000000000000000000e08bf9c00a000000",
+      "address": "0x0000004e500a57fe572e914e4bb4a88cc4f4dea1",
+      "src": "GhostEscrowV2OpenCImpl.sol"
+    }
+  },
+  "spares": {
+    "_comment": "Extra ground salts (thread-race dupes). Swap in if a chosen salt is ever burned. Same suffix, same invariants.",
+    "dea1": {
+      "salt": "0x0498000000000000000000000000000000000000000000000305c5bc36000000",
+      "address": "0x0000008254183b994c4b3c0bfcd657b48b44dea1"
+    },
+    "fac7": {
+      "salt": "0x023100000000000000000000000000000000000000000000ce1f5fcd47000000",
+      "address": "0x0000003ef9ee62c39d00aac78049e23e7619fac7"
+    },
+    "5afe": {
+      "salt": "0x06980000000000000000000000000000000000000000000011c9bd7c18000000",
+      "address": "0x000000a361522ac363ca61f24cb831f4cb495afe"
+    }
+  }
+}
