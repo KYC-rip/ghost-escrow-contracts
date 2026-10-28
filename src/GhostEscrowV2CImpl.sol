@@ -109,6 +109,18 @@ contract GhostEscrowV2CImpl is ReentrancyGuard, EIP712 {
     /// F7: immutable, set per template deployment — 25_000e6 is $25k ONLY for
     /// 6-decimal tokens; an 18-decimal template passes its own scaled value.
     uint256 public immutable HIGH_VALUE_THRESHOLD;
+    /// v5 D3: arbitrator fee = max(dealAmount * ARB_FEE_BPS / 1e4, MIN_ARB_FEE), stored at initialize.
+    uint256 public immutable ARB_FEE_BPS;
+    uint256 public immutable MIN_ARB_FEE;
+    /// v5 D4: keeper tip per un-sticking call = max(dealAmount * TIP_BPS / 1e4, MIN_TIP), all tips <= platform fee.
+    uint256 public immutable TIP_BPS;
+    uint256 public immutable MIN_TIP;
+    /// v5 B: random arbitrator draw from a future blockhash; re-armed at most MAX_REARMS times (R2).
+    uint256 public constant DRAW_DELAY = 4;
+    uint256 public constant DRAW_HORIZON = 256;
+    uint8 public constant MAX_REARMS = 2;
+    /// v5 E1/R8: after this long without anyone able to decide, either party may split 50/50.
+    uint256 public constant NO_ARB_TIMEOUT = 14 days;
     uint256 public constant APPEAL_WINDOW = 48 hours;
     uint256 public constant APPEAL_BOND_BPS = 2000;
     uint256 public constant MIN_AUTO_RELEASE = 1 days;
@@ -142,14 +154,34 @@ contract GhostEscrowV2CImpl is ReentrancyGuard, EIP712 {
     /// @dev Who paid what, so expiry refunds go to the actual depositor.
     mapping(address => uint256) public depositedBy;
 
+    /// v5 R1: explicit dispute phases (v4 overloaded arbitrator == 0 as "slashed").
+    enum ArbPhase {
+        None, // no dispute
+        Drawing, // low-value dispute: waiting for drawArbitrator()
+        Seated, // a drawn arbitrator holds the case
+        Slashed, // the seated arbitrator was SLA-slashed and cleared
+        Exhausted, // the draw missed its horizon MAX_REARMS+1 times: only mutual paths / stalemateSplit
+        Panel // high-value (or escalated): the court owns the case
+    }
+
+    ArbPhase public arbPhase;
+    uint256 public createdAtBlock; // R9: draw admits only arbitrators staked strictly before this block
+    uint256 public disputeOpenedAt;
+    uint256 public drawBlock;
+    uint8 public rearms;
+    /// v5 F3: payouts a recipient couldn't receive (token blocklist) — pull via withdrawOwed().
+    mapping(address => uint256) public owed;
+    uint256 public owedTotal;
+    /// v5 D4: keeper tips, funded out of the platform fee at settlement; claimable once the deal is terminal.
+    mapping(address => uint256) public tipOwed;
+    uint256 public tipsTotal;
+
     // ─── EIP-712 typehashes (verifyingContract = this deal) ─────────────────
     // Identical to v1.1 so the client signing libs work unchanged for v2 deals.
 
     bytes32 private constant RELEASE_TYPEHASH = keccak256("Release(uint256 nonce,uint256 deadline)");
     bytes32 private constant REFUND_TYPEHASH = keccak256("Refund(uint256 nonce,uint256 deadline)");
     bytes32 private constant SPLIT_TYPEHASH = keccak256("Split(uint256 buyerAmount,uint256 nonce,uint256 deadline)");
-    bytes32 private constant REPLACE_ARB_TYPEHASH =
-        keccak256("ReplaceArbitrator(address newArbitrator,uint256 nonce,uint256 deadline)");
     bytes32 private constant RESCUE_TYPEHASH =
         keccak256("RescueToken(address token,address to,uint256 nonce,uint256 deadline)");
 
@@ -163,7 +195,13 @@ contract GhostEscrowV2CImpl is ReentrancyGuard, EIP712 {
     event Refunded(address indexed to, uint256 amount, uint256 platformFee);
     event Split(uint256 buyerAmount, uint256 sellerAmount, uint256 platformFee, bool byArbitrator);
     event Ruled(uint256 buyerAmount, uint256 sellerAmount, uint256 platformFee, bytes32 rationaleHash);
-    event ArbitratorReplaced(address indexed oldArb, address indexed newArb);
+    event ArbitratorDrawn(address indexed arb);
+    event DrawRearmed(uint256 drawBlock);
+    event DrawExhausted();
+    event StalemateSplit(uint256 toBuyer, uint256 toSeller);
+    event KeeperTip(address indexed keeper, uint256 amount);
+    event OwedCredited(address indexed to, uint256 amount);
+    event OwedWithdrawn(address indexed to, uint256 amount);
     event ArbitratorFeeSettled(address indexed to, uint256 amount, bool openerWon);
     event ArbitratorSlashed(address indexed arb, uint256 amount);
     event Expired(uint256 held);
@@ -178,15 +216,26 @@ contract GhostEscrowV2CImpl is ReentrancyGuard, EIP712 {
     ///      storage) — clones start with zeroed storage, so each clone is
     ///      initializable exactly once, by the factory, in the same tx as its
     ///      CREATE2 deploy (no uninitialized-clone window).
-    constructor(address _factory, ArbitratorRegistry _registry, uint256 _highValueThreshold)
-        EIP712("GhostEscrow", "1")
-    {
+    constructor(
+        address _factory,
+        ArbitratorRegistry _registry,
+        uint256 _highValueThreshold,
+        uint256 _arbFeeBps,
+        uint256 _minArbFee,
+        uint256 _tipBps,
+        uint256 _minTip
+    ) EIP712("GhostEscrow", "1") {
         require(_factory != address(0), "zero factory");
         require(address(_registry) != address(0), "zero registry");
         require(_highValueThreshold > 0, "zero threshold");
         FACTORY = _factory;
         ARBITRATOR_REGISTRY = _registry;
         HIGH_VALUE_THRESHOLD = _highValueThreshold;
+        require(_arbFeeBps <= 1000 && _tipBps <= 100, "bad fee params");
+        ARB_FEE_BPS = _arbFeeBps;
+        MIN_ARB_FEE = _minArbFee;
+        TIP_BPS = _tipBps;
+        MIN_TIP = _minTip;
         _initialized = true; // the implementation itself can never be a deal
     }
 
@@ -215,15 +264,15 @@ contract GhostEscrowV2CImpl is ReentrancyGuard, EIP712 {
         ) = abi.decode(initData, (address, address, address, address, uint256, uint256, uint256, uint256));
 
         require(_token != address(0) && _buyer != address(0) && _seller != address(0), "zero addr");
-        require(_arbitrator != address(0) && _feeRecipient != address(0), "zero addr");
+        require(_feeRecipient != address(0), "zero addr");
         require(_buyer != _seller, "same party");
-        require(_arbitrator != _buyer && _arbitrator != _seller, "bad arb");
+        // v5 D1/R4: no arbitrator (and no hand-set fee) at creation — one is drawn at random on dispute.
+        require(_arbitrator == address(0) && _arbitratorFee == 0, "no arb at init");
         require(_dealAmount > 0, "zero amount");
         require(_platformFeeBps <= 1000, "fee too high"); // hard cap 10%
         require(_autoReleaseDelay >= MIN_AUTO_RELEASE && _autoReleaseDelay <= MAX_AUTO_RELEASE, "bad auto-release");
         require(_depositTimeout >= MIN_DEPOSIT_TIMEOUT && _depositTimeout <= MAX_DEPOSIT_TIMEOUT, "bad deposit timeout");
         // §5.1-C eligibility gate + C-5 court-bound gate (moved from the factory).
-        require(ARBITRATOR_REGISTRY.isEligible(_arbitrator, _dealAmount), "arb not eligible");
         require(ARBITRATOR_REGISTRY.court() != address(0), "no court");
 
         // F6: bind the deal token to the registry's staking token (USDC). Keeps
@@ -234,11 +283,12 @@ contract GhostEscrowV2CImpl is ReentrancyGuard, EIP712 {
         token = IERC20(_token);
         buyer = _buyer;
         seller = _seller;
-        arbitrator = _arbitrator;
         feeRecipient = _feeRecipient;
         dealAmount = _dealAmount;
         platformFeeBps = _platformFeeBps;
-        arbitratorFee = _arbitratorFee;
+        uint256 pctFee = (_dealAmount * ARB_FEE_BPS) / 10_000;
+        arbitratorFee = pctFee > MIN_ARB_FEE ? pctFee : MIN_ARB_FEE; // R4: the real fee, readable from day one
+        createdAtBlock = block.number;
         depositDeadline = block.timestamp + _depositTimeout;
         autoReleaseDelay = _autoReleaseDelay;
 
@@ -306,7 +356,7 @@ contract GhostEscrowV2CImpl is ReentrancyGuard, EIP712 {
         _setState(State.Completed);
         _settleFeePotToOpener();
         _payDeal(seller, toSeller);
-        _payDeal(feeRecipient, fee);
+        _payFee(fee);
         if (fromDisputed) ARBITRATOR_REGISTRY.onResolved(arbitrator, address(this)); // CEI: after state
         emit Released(seller, toSeller, fee);
     }
@@ -323,7 +373,7 @@ contract GhostEscrowV2CImpl is ReentrancyGuard, EIP712 {
         _setState(State.Cancelled);
         _settleFeePotToOpener();
         _payDeal(buyer, toBuyer);
-        _payDeal(feeRecipient, fee);
+        _payFee(fee);
         if (fromDisputed) ARBITRATOR_REGISTRY.onResolved(arbitrator, address(this)); // CEI: after state
         emit Refunded(buyer, toBuyer, fee);
     }
@@ -345,38 +395,6 @@ contract GhostEscrowV2CImpl is ReentrancyGuard, EIP712 {
         if (fromDisputed) ARBITRATOR_REGISTRY.onResolved(arbitrator, address(this)); // CEI: after state
     }
 
-    /// @notice Replace the arbitrator by mutual agreement. The NEW arbitrator
-    ///         must be bonded and eligible for this deal's value (view-only
-    ///         STATICCALL to the registry — see contract NatSpec). When the
-    ///         deal is Disputed, the replacement also re-anchors the SLA clock:
-    ///         the old arbitrator is resolved (openCases--) and the new one
-    ///         assigned (openCases++ + fresh assignedAt) via the registry.
-    function replaceArbitrator(
-        address newArbitrator,
-        uint256 deadline,
-        bytes calldata buyerSig,
-        bytes calldata sellerSig
-    ) external nonReentrant {
-        require(state == State.Active || state == State.Disputed, "bad state");
-        bool fromDisputed = state == State.Disputed;
-        require(newArbitrator != address(0) && newArbitrator != buyer && newArbitrator != seller, "bad arb");
-        require(ARBITRATOR_REGISTRY.isEligible(newArbitrator, dealAmount), "arb not eligible");
-        _consumeMutual(
-            keccak256(abi.encode(REPLACE_ARB_TYPEHASH, newArbitrator, nonce, deadline)), deadline, buyerSig, sellerSig
-        );
-
-        address old = arbitrator;
-        arbitrator = newArbitrator;
-        if (fromDisputed && dealAmount < HIGH_VALUE_THRESHOLD) {
-            // G1: panel-required deals carry no registry assignment (F1) — and
-            // must not gain one here, or the replacement arb inherits the exact
-            // cannot-rule SLA trap F1 removes.
-            ARBITRATOR_REGISTRY.onResolved(old, address(this));
-            ARBITRATOR_REGISTRY.onAssigned(newArbitrator, address(this));
-        }
-        emit ArbitratorReplaced(old, newArbitrator);
-    }
-
     function rescueToken(address stray, address to, uint256 deadline, bytes calldata buyerSig, bytes calldata sellerSig)
         external
         nonReentrant
@@ -384,7 +402,7 @@ contract GhostEscrowV2CImpl is ReentrancyGuard, EIP712 {
         if (stray == address(token)) {
             require(
                 (state == State.Completed || state == State.Cancelled || state == State.Expired) && deposited == 0
-                    && arbitratorFeePot == 0,
+                    && arbitratorFeePot == 0 && owedTotal == 0,
                 "deal token not settled"
             );
         }
@@ -411,17 +429,49 @@ contract GhostEscrowV2CImpl is ReentrancyGuard, EIP712 {
             arbitratorFeePot = arbitratorFee;
         }
         disputeOpener = msg.sender;
+        disputeOpenedAt = block.timestamp;
         autoReleaseDeadline = type(uint256).max; // freeze auto-release
         _setState(State.Disputed);
         if (dealAmount >= HIGH_VALUE_THRESHOLD) {
-            // F1: NO registry assignment on a panel-required deal — the nominated
-            // arb is forbidden to rule() here, so an SLA clock could only arm an
-            // unfair, opener-rewarded slash. The court case owns this flow.
-            IAppeal(ARBITRATOR_REGISTRY.court()).prepareFirstPanel(address(this), arbitrator); // C-2
+            // C-2: high-value deals go straight to a court-drawn 3-panel (no single arbitrator).
+            arbPhase = ArbPhase.Panel;
+            IAppeal(ARBITRATOR_REGISTRY.court()).prepareFirstPanel(address(this), address(0));
         } else {
-            ARBITRATOR_REGISTRY.onDisputeOpened(arbitrator, msg.sender); // CEI: after state
+            // v5 D1: the arbitrator is drawn at random from a FUTURE blockhash (drawArbitrator).
+            arbPhase = ArbPhase.Drawing;
+            drawBlock = block.number + DRAW_DELAY;
         }
         emit DisputeOpened(msg.sender);
+    }
+
+    /// @notice v5 D1: seat a random eligible arbitrator. Permissionless (the keeper, either party, anyone); the
+    ///         seed is blockhash(drawBlock), fixed and unknowable when the dispute opened. If nobody calls within
+    ///         DRAW_HORIZON blocks the draw re-arms on a new future block, at most MAX_REARMS times; after that the
+    ///         deal is Exhausted (R2): suppressing every caller can at best force the stalemate split, never pick
+    ///         an arbitrator. The SLA clock starts at the draw.
+    function drawArbitrator() external nonReentrant {
+        require(state == State.Disputed && arbPhase == ArbPhase.Drawing, "not drawing");
+        require(block.number > drawBlock, "too early");
+        if (block.number - drawBlock > DRAW_HORIZON) {
+            if (rearms >= MAX_REARMS) {
+                arbPhase = ArbPhase.Exhausted;
+                emit DrawExhausted();
+                return;
+            }
+            rearms++;
+            drawBlock = block.number + DRAW_DELAY;
+            emit DrawRearmed(drawBlock);
+            return;
+        }
+        address arb = ARBITRATOR_REGISTRY.drawEligible(
+            keccak256(abi.encode(address(this), blockhash(drawBlock))), dealAmount, buyer, seller, createdAtBlock
+        );
+        require(arb != address(0), "no eligible arb");
+        arbitrator = arb;
+        arbPhase = ArbPhase.Seated;
+        _accrueTip(msg.sender);
+        ARBITRATOR_REGISTRY.onDisputeOpened(arb, disputeOpener); // SLA anchor = now
+        emit ArbitratorDrawn(arb);
     }
 
     /// @notice Arbitrator's ruling — single-arb deals below the panel threshold
@@ -432,13 +482,12 @@ contract GhostEscrowV2CImpl is ReentrancyGuard, EIP712 {
     ///         settleAppealOverturn if a party appeals.
     function rule(uint256 buyerAmount, uint256 sellerAmount, bytes32 rationaleHash) external nonReentrant {
         require(state == State.Disputed, "not disputed");
-        require(msg.sender == arbitrator, "not arbitrator");
-        require(dealAmount < HIGH_VALUE_THRESHOLD, "panel required");
+        require(arbPhase == ArbPhase.Seated && msg.sender == arbitrator, "not arbitrator");
         require(buyerAmount + sellerAmount == dealAmount, "sum != dealAmount");
-        // CEI: internal state first, external registry call last (C-REV-3).
+        // F1 (v5): the case stays OPEN in the registry (openCases) through the appeal window, so the arbitrator
+        // can't complete a withdrawal before an overturn slash could land; it resolves at finalize/settle.
         _setState(State.RuledPendingAppeal);
         _recordRuling(buyerAmount, sellerAmount, rationaleHash);
-        ARBITRATOR_REGISTRY.onResolved(arbitrator, address(this));
     }
 
     function _recordRuling(uint256 buyerAmount, uint256 sellerAmount, bytes32 rationaleHash) internal {
@@ -455,19 +504,17 @@ contract GhostEscrowV2CImpl is ReentrancyGuard, EIP712 {
         require(msg.sender == ARBITRATOR_REGISTRY.court(), "not court");
         require(state == State.Disputed, "not disputed");
         require(buyerAmount + sellerAmount == dealAmount, "sum != dealAmount");
-        // Clear the originally-assigned arbitrator's SLA case: a panel superseded
-        // them, so they must NOT stay SLA-slashable for "not ruling" (Escrow-B fix).
-        // CEI: registry bookkeeping + state effects BEFORE the external pot transfers.
-        ARBITRATOR_REGISTRY.onResolved(arbitrator, address(this));
+        // F10 (v5): a Panel-phase deal never carries a registry assignment (high-value deals never seat one;
+        // escalated deals' arbitrator was cleared by the SLA slash), so there is nothing to resolve here.
         _setState(State.RuledPendingAppeal);
         _recordRuling(buyerAmount, sellerAmount, rationaleHash);
         uint256 pot = arbitratorFeePot;
         if (pot > 0) {
             arbitratorFeePot = 0;
             uint256 third = pot / 3;
-            token.safeTransfer(p0, third + (pot - third * 3));
-            token.safeTransfer(p1, third);
-            token.safeTransfer(p2, third);
+            _payOrOwe(p0, third + (pot - third * 3));
+            _payOrOwe(p1, third);
+            _payOrOwe(p2, third);
             emit ArbitratorFeeSettled(p0, pot, true);
         }
     }
@@ -499,7 +546,9 @@ contract GhostEscrowV2CImpl is ReentrancyGuard, EIP712 {
         require(!appealed, "appealed");
         require(block.timestamp > appealDeadline, "too early");
         address potTo = _openerWon(rulingBuyerAmount, rulingSellerAmount) ? disputeOpener : arbitrator;
+        _accrueTip(msg.sender); // D4: before the fee is paid out
         _settleRuling(rulingBuyerAmount, rulingSellerAmount, potTo);
+        ARBITRATOR_REGISTRY.onResolved(arbitrator, address(this)); // F1: the case closes only now
     }
 
     function settleAppealUphold() external nonReentrant {
@@ -507,6 +556,7 @@ contract GhostEscrowV2CImpl is ReentrancyGuard, EIP712 {
         require(state == State.RuledPendingAppeal && appealed, "not appealable");
         address potTo = _openerWon(rulingBuyerAmount, rulingSellerAmount) ? disputeOpener : arbitrator;
         _settleRuling(rulingBuyerAmount, rulingSellerAmount, potTo);
+        ARBITRATOR_REGISTRY.onResolved(arbitrator, address(this)); // F1
     }
 
     function settleAppealOverturn(uint256 buyerAmount, uint256 sellerAmount) external nonReentrant {
@@ -514,6 +564,7 @@ contract GhostEscrowV2CImpl is ReentrancyGuard, EIP712 {
         require(state == State.RuledPendingAppeal && appealed, "not appealable");
         require(buyerAmount + sellerAmount == dealAmount, "sum != dealAmount");
         _settleRuling(buyerAmount, sellerAmount, disputeOpener);
+        ARBITRATOR_REGISTRY.onResolved(arbitrator, address(this)); // F1
     }
 
     function _settleRuling(uint256 buyerAmount, uint256 sellerAmount, address potTo) internal {
@@ -525,12 +576,12 @@ contract GhostEscrowV2CImpl is ReentrancyGuard, EIP712 {
         if (arbitratorFeePot > 0 && potTo != address(0)) {
             uint256 pot = arbitratorFeePot;
             arbitratorFeePot = 0;
-            token.safeTransfer(potTo, pot);
+            _payOrOwe(potTo, pot);
             emit ArbitratorFeeSettled(potTo, pot, potTo == disputeOpener);
         }
         if (finalBuyer > 0) _payDeal(buyer, finalBuyer);
         if (finalSeller > 0) _payDeal(seller, finalSeller);
-        if (fee > 0) _payDeal(feeRecipient, fee);
+        _payFee(fee);
         emit Split(finalBuyer, finalSeller, fee, true);
         emit Ruled(buyerAmount, sellerAmount, fee, rulingRationale);
     }
@@ -552,13 +603,14 @@ contract GhostEscrowV2CImpl is ReentrancyGuard, EIP712 {
     ///         proceeds; the pot pays the escalation panel, and the 30-day
     ///         claimStrandedPot valve returns it if no panel ever seats.
     function slashForTimeout() external nonReentrant {
-        require(state == State.Disputed, "not disputed");
-        require(dealAmount < HIGH_VALUE_THRESHOLD, "panel case"); // F1
+        require(state == State.Disputed && arbPhase == ArbPhase.Seated, "no seated arb"); // F1 / R1
         address cleared = arbitrator;
         uint256 slashedAmt = ARBITRATOR_REGISTRY.slashTimeoutStake(address(this));
         timeoutSlashedArb = cleared;
         timeoutSlashedAt = block.timestamp;
         arbitrator = address(0);
+        arbPhase = ArbPhase.Slashed;
+        _accrueTip(msg.sender); // D4
         emit ArbitratorSlashed(cleared, slashedAmt);
     }
 
@@ -568,10 +620,10 @@ contract GhostEscrowV2CImpl is ReentrancyGuard, EIP712 {
     ///         (openDispute needs Active). Either party may re-request; the
     ///         court rejects it while a case is still in flight.
     function requestFirstPanel() external nonReentrant {
-        require(state == State.Disputed, "not disputed");
-        require(dealAmount >= HIGH_VALUE_THRESHOLD, "not panel deal");
+        require(state == State.Disputed && arbPhase == ArbPhase.Panel, "not panel deal");
+        require(block.timestamp < disputeOpenedAt + NO_ARB_TIMEOUT, "use stalemateSplit"); // R8
         require(msg.sender == buyer || msg.sender == seller, "not party");
-        IAppeal(ARBITRATOR_REGISTRY.court()).prepareFirstPanel(address(this), arbitrator);
+        IAppeal(ARBITRATOR_REGISTRY.court()).prepareFirstPanel(address(this), timeoutSlashedArb);
     }
 
     /// @notice F5: after a timeout slash cleared the arbitrator, either party
@@ -581,9 +633,9 @@ contract GhostEscrowV2CImpl is ReentrancyGuard, EIP712 {
     ///         slashed arb is excluded from the draw; the retained fee pot pays
     ///         the panel via applyFirstRuling's third-split.
     function escalateAfterTimeout() external nonReentrant {
-        require(state == State.Disputed, "not disputed");
-        require(arbitrator == address(0), "arb set");
+        require(state == State.Disputed && arbPhase == ArbPhase.Slashed, "not slashed"); // R1
         require(msg.sender == buyer || msg.sender == seller, "not party");
+        arbPhase = ArbPhase.Panel;
         IAppeal(ARBITRATOR_REGISTRY.court()).prepareFirstPanel(address(this), timeoutSlashedArb);
     }
 
@@ -591,15 +643,67 @@ contract GhostEscrowV2CImpl is ReentrancyGuard, EIP712 {
     ///         timeout slash (and no court case is in flight), the opener
     ///         reclaims the fee pot they prepaid.
     function claimStrandedPot() external nonReentrant {
-        require(state == State.Disputed && arbitrator == address(0), "not stranded");
+        require(state == State.Disputed && arbPhase == ArbPhase.Slashed && timeoutSlashedAt != 0, "not stranded"); // R1
         require(msg.sender == disputeOpener, "not opener");
         require(block.timestamp >= timeoutSlashedAt + STRANDED_POT_DELAY, "too early");
         require(!IAppeal(ARBITRATOR_REGISTRY.court()).isCaseActive(address(this)), "case in flight");
         uint256 pot = arbitratorFeePot;
         require(pot > 0, "no pot");
         arbitratorFeePot = 0;
-        token.safeTransfer(disputeOpener, pot);
+        _payOrOwe(disputeOpener, pot);
         emit ArbitratorFeeSettled(disputeOpener, pot, true);
+    }
+
+    /// @notice v5 E1/R8: nobody was ever able to decide this dispute (no arbitrator could be drawn, the draw was
+    ///         exhausted, the seated one was slashed, or no court panel could seat) for NO_ARB_TIMEOUT: either
+    ///         party may split the deal 50/50, fee-free; the fee pot goes back to the opener. Keeper tips already
+    ///         earned are funded from the deal (there is no platform fee to take them from). Funds can never
+    ///         be stuck.
+    function stalemateSplit() external nonReentrant {
+        require(state == State.Disputed, "not disputed");
+        require(msg.sender == buyer || msg.sender == seller, "not party");
+        require(block.timestamp >= disputeOpenedAt + NO_ARB_TIMEOUT, "too early");
+        ArbPhase ph = arbPhase;
+        require(
+            ph == ArbPhase.Drawing || ph == ArbPhase.Exhausted
+                || ((ph == ArbPhase.Panel || ph == ArbPhase.Slashed)
+                    && !IAppeal(ARBITRATOR_REGISTRY.court()).isCaseActive(address(this))),
+            "decidable"
+        );
+        _setState(State.Completed);
+        _settleFeePotToOpener();
+        uint256 net = dealAmount - tipsTotal;
+        uint256 toBuyer = net / 2;
+        _payDeal(buyer, toBuyer);
+        _payDeal(seller, net - toBuyer);
+        emit StalemateSplit(toBuyer, net - toBuyer);
+    }
+
+    /// @notice v5 D4: the court credits the tip for a successful drawPanel / dismiss on this deal. Only while the
+    ///         deal is still open (so the tip is funded by the fee at settlement); a no-op afterwards.
+    function creditKeeperTip(address keeper) external {
+        require(msg.sender == ARBITRATOR_REGISTRY.court(), "not court");
+        if (state == State.Disputed || state == State.RuledPendingAppeal) _accrueTip(keeper);
+    }
+
+    /// @notice Collect keeper tips once the deal has settled.
+    function claimTip() external nonReentrant {
+        require(state == State.Completed || state == State.Cancelled, "not settled");
+        uint256 amount = tipOwed[msg.sender];
+        require(amount > 0, "no tip");
+        tipOwed[msg.sender] = 0;
+        deposited -= amount;
+        token.safeTransfer(msg.sender, amount);
+    }
+
+    /// @notice F3: collect a payout that couldn't be pushed (e.g. while the address was on a token blocklist).
+    function withdrawOwed() external nonReentrant {
+        uint256 amount = owed[msg.sender];
+        require(amount > 0, "nothing owed");
+        owed[msg.sender] = 0;
+        owedTotal -= amount;
+        token.safeTransfer(msg.sender, amount);
+        emit OwedWithdrawn(msg.sender, amount);
     }
 
     // ─── Permissionless timeouts ─────────────────────────────────────────────
@@ -608,16 +712,10 @@ contract GhostEscrowV2CImpl is ReentrancyGuard, EIP712 {
         require(state == State.Created || state == State.PartiallyDeposited, "bad state");
         require(block.timestamp > depositDeadline, "too early");
 
+        // F2 (v5): no push here — a blocklisted buyer must not be able to brick expiry. Depositors pull with
+        // claimExpired().
         _setState(State.Expired);
         emit Expired(deposited);
-
-        uint256 own = depositedBy[buyer];
-        if (own > 0) {
-            depositedBy[buyer] = 0;
-            deposited -= own;
-            token.safeTransfer(buyer, own);
-            emit ExpiredClaimed(buyer, own);
-        }
     }
 
     function claimExpired() external nonReentrant {
@@ -635,10 +733,11 @@ contract GhostEscrowV2CImpl is ReentrancyGuard, EIP712 {
         require(state == State.Active, "not active");
         require(block.timestamp >= autoReleaseDeadline, "too early");
 
+        _accrueTip(msg.sender); // D4
         (uint256 toSeller, uint256 fee) = _split(dealAmount);
         _setState(State.Completed);
         _payDeal(seller, toSeller);
-        _payDeal(feeRecipient, fee);
+        _payFee(fee);
         emit Released(seller, toSeller, fee);
     }
 
@@ -657,7 +756,7 @@ contract GhostEscrowV2CImpl is ReentrancyGuard, EIP712 {
 
         if (finalBuyer > 0) _payDeal(buyer, finalBuyer);
         if (finalSeller > 0) _payDeal(seller, finalSeller);
-        if (fee > 0) _payDeal(feeRecipient, fee);
+        _payFee(fee);
         emit Split(finalBuyer, finalSeller, fee, byArbitrator);
     }
 
@@ -665,8 +764,35 @@ contract GhostEscrowV2CImpl is ReentrancyGuard, EIP712 {
         if (arbitratorFeePot > 0) {
             uint256 pot = arbitratorFeePot;
             arbitratorFeePot = 0;
-            token.safeTransfer(disputeOpener, pot);
+            _payOrOwe(disputeOpener, pot);
             emit ArbitratorFeeSettled(disputeOpener, pot, true);
+        }
+    }
+
+    /// @dev The platform fee net of keeper tips (tips stay in `deposited` until claimTip; total tips <= fee).
+    function _payFee(uint256 fee) internal {
+        if (fee > tipsTotal) _payDeal(feeRecipient, fee - tipsTotal);
+    }
+
+    /// @dev D4: credit a keeper tip, capped so all tips together never exceed this deal's platform fee.
+    function _accrueTip(address keeper) internal {
+        uint256 cap = (dealAmount * platformFeeBps) / 10_000;
+        if (keeper == address(0) || tipsTotal >= cap) return;
+        uint256 t = (dealAmount * TIP_BPS) / 10_000;
+        if (t < MIN_TIP) t = MIN_TIP;
+        if (t > cap - tipsTotal) t = cap - tipsTotal;
+        tipOwed[keeper] += t;
+        tipsTotal += t;
+        emit KeeperTip(keeper, t);
+    }
+
+    /// @dev F3: a recipient's blocklist must never revert a settlement; park the amount for withdrawOwed().
+    function _payOrOwe(address to, uint256 amount) internal {
+        if (amount == 0) return;
+        if (!token.trySafeTransfer(to, amount)) {
+            owed[to] += amount;
+            owedTotal += amount;
+            emit OwedCredited(to, amount);
         }
     }
 
@@ -680,7 +806,7 @@ contract GhostEscrowV2CImpl is ReentrancyGuard, EIP712 {
     function _payDeal(address to, uint256 amount) internal {
         if (amount == 0) return;
         deposited -= amount;
-        token.safeTransfer(to, amount);
+        _payOrOwe(to, amount);
     }
 
     function _consumeMutual(bytes32 structHash, uint256 deadline, bytes calldata buyerSig, bytes calldata sellerSig)

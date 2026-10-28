@@ -39,13 +39,11 @@ contract SecurityFixesTest is GhostTestBaseD {
     uint256 internal constant HV_ARB_STAKE = 3_000e6; // eligible for HV_AMOUNT
     uint256 internal constant HV_PANEL_STAKE = 3_100e6; // strictly higher tier
 
-    bytes32 internal constant REPLACE_ARB_TYPEHASH =
-        keccak256("ReplaceArbitrator(address newArbitrator,uint256 nonce,uint256 deadline)");
 
     // ─── helpers ───────────────────────────────────────────────────────────
 
     function _hvInitData() internal view returns (bytes memory) {
-        return abi.encode(address(token), buyer, seller, arb, HV_AMOUNT, ARB_FEE, DEPOSIT_TIMEOUT, AUTO_RELEASE);
+        return abi.encode(address(token), buyer, seller, address(0), HV_AMOUNT, uint256(0), DEPOSIT_TIMEOUT, AUTO_RELEASE);
     }
 
     function _createHv(bytes32 salt) internal returns (GhostEscrowV2CImpl e) {
@@ -56,9 +54,10 @@ contract SecurityFixesTest is GhostTestBaseD {
         token.approve(address(e), HV_AMOUNT);
         vm.prank(buyer);
         e.deposit(HV_AMOUNT);
-        _fund(buyer, ARB_FEE);
+        uint256 fee = e.arbitratorFee(); // v5: 1 % of the deal = $300
+        _fund(buyer, fee);
         vm.prank(buyer);
-        token.approve(address(e), ARB_FEE);
+        token.approve(address(e), fee);
         vm.prank(buyer);
         e.openDispute();
     }
@@ -67,16 +66,6 @@ contract SecurityFixesTest is GhostTestBaseD {
         _stake(p1, HV_PANEL_STAKE, "p1");
         _stake(p2, HV_PANEL_STAKE, "p2");
         _stake(p3, HV_PANEL_STAKE, "p3");
-    }
-
-    function _replaceSigs(GhostEscrowV2CImpl e, address newArb, uint256 deadline)
-        internal
-        returns (bytes memory bSig, bytes memory sSig)
-    {
-        bytes32 structHash = keccak256(abi.encode(REPLACE_ARB_TYPEHASH, newArb, e.nonce(), deadline));
-        bytes32 d = SigUtils.digest(address(e), chainId, structHash);
-        bSig = _sig(buyerPk, d);
-        sSig = _sig(sellerPk, d);
     }
 
     function _voteMajority(address deal, uint256 b, uint256 s) internal {
@@ -96,7 +85,7 @@ contract SecurityFixesTest is GhostTestBaseD {
         assertEq(registry.openCases(arb), 0, "no openCases for the nominated arb");
 
         vm.warp(block.timestamp + SLA_DURATION + 1);
-        vm.expectRevert(bytes("panel case"));
+        vm.expectRevert(bytes("no seated arb")); // v5 R1: panel deals never seat an arbitrator
         e.slashForTimeout();
     }
 
@@ -121,19 +110,7 @@ contract SecurityFixesTest is GhostTestBaseD {
         assertTrue(active, "fresh first-panel case opened");
     }
 
-    // ─── G1: replaceArbitrator must not re-create the F1 assignment ───────
-
-    function test_G1_replaceOnHighValueDisputed_skipsRegistryAssignment() public {
-        GhostEscrowV2CImpl e = _createHv(bytes32(uint256(104)));
-        address newArb = vm.addr(0xA9B9);
-        _stake(newArb, HV_ARB_STAKE, "new-arb");
-        (bytes memory bSig, bytes memory sSig) = _replaceSigs(e, newArb, _deadline());
-        e.replaceArbitrator(newArb, _deadline(), bSig, sSig);
-        assertEq(e.arbitrator(), newArb);
-        (bool assigned,,,,) = registry.assignmentOf(address(e));
-        assertFalse(assigned, "replacement must not arm an SLA case on a panel deal");
-        assertEq(registry.openCases(newArb), 0);
-    }
+    // G1 (replaceArbitrator on a panel deal) is moot in v5: replaceArbitrator was removed (D1).
 
     // ─── G2 gating ─────────────────────────────────────────────────────────
 
@@ -172,8 +149,8 @@ contract SecurityFixesTest is GhostTestBaseD {
 
     function test_F3_panelMembersLockedWhileCaseLive_releasedOnSettle() public {
         _stakeArbEligible();
-        _stakePanel();
         GhostEscrowV2CImpl e = _createStd(bytes32(uint256(107)));
+        _stakePanel(); // v5: staked after the deal, so only `arb` is drawable (panel seats still fine)
         _fundActive(e);
         _toDrawnAppeal(e);
         (address[3] memory panel, uint8 len) = court.panelOf(address(e));
@@ -192,8 +169,8 @@ contract SecurityFixesTest is GhostTestBaseD {
 
     function test_F3_panelReleasedOnDrawnDismiss() public {
         _stakeArbEligible();
-        _stakePanel();
         GhostEscrowV2CImpl e = _createStd(bytes32(uint256(108)));
+        _stakePanel(); // v5: staked after the deal, so only `arb` is drawable (panel seats still fine)
         _fundActive(e);
         _toDrawnAppeal(e);
         (address[3] memory panel,) = court.panelOf(address(e));
@@ -259,8 +236,8 @@ contract SecurityFixesTest is GhostTestBaseD {
 
     function test_F5_slashRetainsPot_escalatePaysPanel() public {
         _stakeArbEligible();
-        _stakePanel();
         GhostEscrowV2CImpl e = _createStd(bytes32(uint256(109)));
+        _stakePanel(); // v5: staked after the deal, so only `arb` is drawable (panel seats still fine)
         _fundActive(e);
         _openDispute(e);
         vm.warp(block.timestamp + SLA_DURATION + 1);
@@ -274,7 +251,7 @@ contract SecurityFixesTest is GhostTestBaseD {
         // Opener cannot yank the pot while the case is live.
         vm.warp(block.timestamp + 30 days);
         vm.prank(buyer);
-        vm.expectRevert(bytes("case in flight"));
+        vm.expectRevert(bytes("not stranded")); // v5: escalated = Panel phase; the pot goes to the panel or the stalemate split
         e.claimStrandedPot();
 
         (,,,,,, uint256 drawBlock,) = court.caseOf(address(e));
@@ -294,7 +271,7 @@ contract SecurityFixesTest is GhostTestBaseD {
         _fundActive(e);
         _openDispute(e);
         vm.prank(buyer);
-        vm.expectRevert(bytes("arb set")); // no slash yet
+        vm.expectRevert(bytes("not slashed")); // v5 R1: no slash yet
         e.escalateAfterTimeout();
         vm.warp(block.timestamp + SLA_DURATION + 1);
         e.slashForTimeout();
@@ -328,6 +305,6 @@ contract SecurityFixesTest is GhostTestBaseD {
         assertEq(stdImpl.HIGH_VALUE_THRESHOLD(), 25_000e6);
         assertEq(openImpl.HIGH_VALUE_THRESHOLD(), 25_000e6);
         vm.expectRevert(bytes("zero threshold"));
-        new GhostEscrowV2CImpl(address(factory), registry, 0);
+        new GhostEscrowV2CImpl(address(factory), registry, 0, 100, 5e6, 1, 1e5);
     }
 }

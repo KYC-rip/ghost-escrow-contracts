@@ -78,8 +78,8 @@ contract DeployD is Script {
         court = new AppealCourt(registry);
         registry.setFactory(address(factory));
         registry.setCourt(address(court));
-        stdImpl = new GhostEscrowV2CImpl(address(factory), registry, cfg.highValueThreshold);
-        openImpl = new GhostEscrowV2OpenCImpl(address(factory), registry, cfg.highValueThreshold);
+        stdImpl = new GhostEscrowV2CImpl(address(factory), registry, cfg.highValueThreshold, 100, 5e6, 1, 1e5);
+        openImpl = new GhostEscrowV2OpenCImpl(address(factory), registry, cfg.highValueThreshold, 100, 5e6, 1, 1e5);
         factory.addTemplate(address(stdImpl));
         factory.addTemplate(address(openImpl));
         vm.stopBroadcast();

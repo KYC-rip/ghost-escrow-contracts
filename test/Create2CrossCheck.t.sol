@@ -43,7 +43,10 @@ contract Create2CrossCheckTest is GhostTestBase {
 address predicted = f.predictAddress(terms, salt);
         // Client-side (TS/ethers) result for these exact fixtures — keeps the
         // frontend CREATE2 predictor honest with the contract.
-        assertEq(predicted, address(uint160(0x00e4887cfca592acb4ae9af41fb8008cd374a70001)), "CREATE2 cross-check failed");
+        // Re-pinned 2026-10-28: the repo now compiles with via_ir (v5 size budget), which changes the LEGACY v1
+        // GhostEscrow creation code and so this CREATE2 address. The v1 app path (embedded creationCode blobs) is
+        // retired; deployed v1 deals are unaffected. Old value under the legacy pipeline: 0xe4887cfca592acb4ae9af41fb8008cd374a70001.
+        assertEq(predicted, address(uint160(0x00f5d9d3920ebc0adffeaa0cdeb135d6e1dc044bbb)), "CREATE2 cross-check failed");
     }
 
     /// The creation code must be metadata-free (bytecode_hash = "none") —

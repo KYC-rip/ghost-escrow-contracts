@@ -47,7 +47,8 @@ contract MockSequentialTemplate {
         _initialized = true;
         (address _token, address _buyer, address _seller, address _arbitrator, uint256 _dealAmount,,,) =
             abi.decode(initData, (address, address, address, address, uint256, uint256, uint256, uint256));
-        require(REGISTRY.isEligible(_arbitrator, _dealAmount), "arb not eligible");
+        // v5 templates take no arbitrator at init; the mock only tolerates the field.
+        require(_arbitrator == address(0) || REGISTRY.isEligible(_arbitrator, _dealAmount), "arb not eligible");
         require(REGISTRY.court() != address(0), "no court");
         token = IERC20(_token);
         buyer = _buyer;
@@ -112,7 +113,7 @@ abstract contract GhostTestBaseD is Test {
     uint256 internal constant OVERTURN_SLASH_BPS = 5000; // 50%
     uint256 internal constant AMOUNT = 4200e6; // $4200
     uint256 internal constant FEE_BPS = 150; // 1.5%
-    uint256 internal constant ARB_FEE = 50e6;
+    uint256 internal constant ARB_FEE = 42e6; // v5: 1 % of AMOUNT (min $5), computed by the template
     uint256 internal constant DEPOSIT_TIMEOUT = 72 hours;
     uint256 internal constant AUTO_RELEASE = 14 days;
     uint256 internal constant STAKE_FOR_AMOUNT = (AMOUNT + STAKE_MULTIPLE - 1) / STAKE_MULTIPLE; // $420
@@ -140,8 +141,8 @@ abstract contract GhostTestBaseD is Test {
         court = new AppealCourt(registry);
         registry.setFactory(address(factory));
         registry.setCourt(address(court));
-        stdImpl = new GhostEscrowV2CImpl(address(factory), registry, 25_000e6);
-        openImpl = new GhostEscrowV2OpenCImpl(address(factory), registry, 25_000e6);
+        stdImpl = new GhostEscrowV2CImpl(address(factory), registry, 25_000e6, 100, 5e6, 1, 1e5);
+        openImpl = new GhostEscrowV2OpenCImpl(address(factory), registry, 25_000e6, 100, 5e6, 1, 1e5);
         factory.addTemplate(address(stdImpl));
         factory.addTemplate(address(openImpl));
     }
@@ -154,6 +155,7 @@ abstract contract GhostTestBaseD is Test {
         token.approve(address(registry), amt);
         vm.prank(who);
         registry.stake(amt, pubkey);
+        vm.roll(block.number + 1); // v5 R5: a stake counts for deals created in LATER blocks only
     }
 
     function _stakeArbEligible() internal {
@@ -170,7 +172,7 @@ abstract contract GhostTestBaseD is Test {
 
     function _initData(address _buyer, address _seller) internal view returns (bytes memory) {
         return abi.encode(
-            address(token), _buyer, _seller, arb, AMOUNT, ARB_FEE, DEPOSIT_TIMEOUT, AUTO_RELEASE
+            address(token), _buyer, _seller, address(0), AMOUNT, uint256(0), DEPOSIT_TIMEOUT, AUTO_RELEASE
         );
     }
 
@@ -191,10 +193,21 @@ abstract contract GhostTestBaseD is Test {
         assertEq(uint256(e.state()), uint256(GhostEscrowV2CImpl.State.Active));
     }
 
+    /// Opens the dispute and, for a low-value deal, runs the v5 random draw (seats whoever is drawable —
+    /// tests keep `arb` the only arbitrator staked before the deal so the draw is deterministic).
     function _openDispute(GhostEscrowV2CImpl e) internal {
-        _fund(buyer, ARB_FEE);
+        _openDisputeOnly(e);
+        if (e.dealAmount() < e.HIGH_VALUE_THRESHOLD()) {
+            vm.roll(e.drawBlock() + 1);
+            e.drawArbitrator();
+        }
+    }
+
+    function _openDisputeOnly(GhostEscrowV2CImpl e) internal {
+        uint256 fee = e.arbitratorFee();
+        _fund(buyer, fee);
         vm.prank(buyer);
-        token.approve(address(e), ARB_FEE);
+        token.approve(address(e), fee);
         vm.prank(buyer);
         e.openDispute();
     }
@@ -202,7 +215,7 @@ abstract contract GhostTestBaseD is Test {
     /// Full path to an appealed, drawn panel on a standard-template clone.
     function _toDrawnAppeal(GhostEscrowV2CImpl e) internal returns (uint256 bond) {
         _openDispute(e);
-        vm.prank(arb);
+        vm.prank(e.arbitrator()); // v5: whoever the random draw seated
         e.rule(0, AMOUNT, keccak256("ruling"));
         bond = (AMOUNT * e.APPEAL_BOND_BPS()) / 10000;
         _fund(buyer, bond);

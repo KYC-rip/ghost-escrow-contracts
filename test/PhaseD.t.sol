@@ -52,7 +52,7 @@ contract PhaseDFactoryTest is GhostTestBaseD {
     function test_activationTimelock_gatesCreate() public {
         // Fresh factory with a 48h delay; templates unusable until it elapses.
         EscrowCloneFactory delayed = new EscrowCloneFactory(registry, feeRecipient, FEE_BPS, 48 hours, address(this));
-        GhostEscrowV2CImpl impl = new GhostEscrowV2CImpl(address(delayed), registry, 25_000e6);
+        GhostEscrowV2CImpl impl = new GhostEscrowV2CImpl(address(delayed), registry, 25_000e6, 100, 5e6, 1, 1e5);
         delayed.addTemplate(address(impl));
         _stakeArbEligible();
         vm.expectRevert(bytes("template not active"));
@@ -133,10 +133,15 @@ contract PhaseDFactoryTest is GhostTestBaseD {
         openImpl.initialize(feeRecipient, FEE_BPS, _initData(buyer, address(0)));
     }
 
-    function test_initialize_enforcesEligibility() public {
-        // arb NOT staked → template-side §5.1-C gate reverts the whole create.
-        vm.expectRevert(bytes("arb not eligible"));
-        factory.createDeal(address(stdImpl), _initData(buyer, seller), bytes32(uint256(12)));
+    function test_initialize_rejectsNominatedArbitrator() public {
+        // v5 D1/R4: an arbitrator (or a hand-set fee) in initData is refused — one is drawn at dispute time.
+        _stakeArbEligible();
+        bytes memory nominated = abi.encode(address(token), buyer, seller, arb, AMOUNT, uint256(0), DEPOSIT_TIMEOUT, AUTO_RELEASE);
+        vm.expectRevert(bytes("no arb at init"));
+        factory.createDeal(address(stdImpl), nominated, bytes32(uint256(12)));
+        bytes memory feeSet = abi.encode(address(token), buyer, seller, address(0), AMOUNT, ARB_FEE, DEPOSIT_TIMEOUT, AUTO_RELEASE);
+        vm.expectRevert(bytes("no arb at init"));
+        factory.createDeal(address(stdImpl), feeSet, bytes32(uint256(15)));
     }
 
     function test_initialize_enforcesCourtBound() public {
@@ -145,7 +150,7 @@ contract PhaseDFactoryTest is GhostTestBaseD {
             IERC20(address(token)), STAKE_MULTIPLE, UNBONDING, SLA_DURATION, SLA_SLASH_BPS, OVERTURN_SLASH_BPS, 0, address(this)
         );
         EscrowCloneFactory f2 = new EscrowCloneFactory(reg2, feeRecipient, FEE_BPS, 0, address(this));
-        GhostEscrowV2CImpl impl2 = new GhostEscrowV2CImpl(address(f2), reg2, 25_000e6);
+        GhostEscrowV2CImpl impl2 = new GhostEscrowV2CImpl(address(f2), reg2, 25_000e6, 100, 5e6, 1, 1e5);
         f2.addTemplate(address(impl2));
         reg2.setFactory(address(f2));
         _fund(arb, STAKE_FOR_AMOUNT);
@@ -182,8 +187,13 @@ contract PhaseDLifecycleTest is GhostTestBaseD {
         assertEq(registry.openCases(arb), 1); // hook authenticated via factory.isEscrow(clone)
         vm.prank(arb);
         e.rule(0, AMOUNT, keccak256("r"));
-        assertEq(registry.openCases(arb), 0);
+        // F1 (v5): the case stays open through the appeal window...
+        assertEq(registry.openCases(arb), 1);
         assertEq(uint256(e.state()), uint256(GhostEscrowV2CImpl.State.RuledPendingAppeal));
+        // ...and closes when the ruling is finalized.
+        vm.warp(block.timestamp + e.APPEAL_WINDOW() + 1);
+        e.finalize();
+        assertEq(registry.openCases(arb), 0);
     }
 
     function test_clone_eip712_mutualRelease_domainIsClone() public {
@@ -201,8 +211,8 @@ contract PhaseDLifecycleTest is GhostTestBaseD {
 
     function test_clone_appeal_uphold_bondToPanel() public {
         _stakeArbEligible();
-        _stakePanel();
         GhostEscrowV2CImpl e = _createStd(bytes32(uint256(22)));
+        _stakePanel(); // v5: after the deal, so only `arb` is drawable
         _fundActive(e);
         uint256 bond = _toDrawnAppeal(e);
         (address[3] memory panel, uint8 len) = court.panelOf(address(e));
@@ -223,8 +233,8 @@ contract PhaseDLifecycleTest is GhostTestBaseD {
 
     function test_clone_appeal_overturn_slashAndMakeWhole() public {
         _stakeArbEligible();
-        _stakePanel();
         GhostEscrowV2CImpl e = _createStd(bytes32(uint256(23)));
+        _stakePanel(); // v5: after the deal, so only `arb` is drawable
         _fundActive(e);
         uint256 bond = _toDrawnAppeal(e);
         (address[3] memory panel,) = court.panelOf(address(e));
@@ -405,9 +415,10 @@ contract PhaseDSequentialCourtTest is GhostTestBaseD {
         panelBefore; // silence
         uint256 b1 = token.balanceOf(p1);
         _runCase(0, AMOUNT); // uphold → bond to panel (deal token)
-        uint256 afterCase1 = token.balanceOf(p1) + token.balanceOf(p2) + token.balanceOf(p3);
+        // F4 (v5): `arb` is a valid panel candidate too (no strictly-higher-stake gate), so count it.
+        uint256 afterCase1 = token.balanceOf(p1) + token.balanceOf(p2) + token.balanceOf(p3) + token.balanceOf(arb);
         _runCase(0, AMOUNT); // second uphold → SECOND bond to panel, same total again
-        uint256 afterCase2 = token.balanceOf(p1) + token.balanceOf(p2) + token.balanceOf(p3);
+        uint256 afterCase2 = token.balanceOf(p1) + token.balanceOf(p2) + token.balanceOf(p3) + token.balanceOf(arb);
         assertEq(afterCase2 - afterCase1, BOND); // exactly one bond per case
         b1; // silence
     }

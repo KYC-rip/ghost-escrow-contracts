@@ -143,12 +143,12 @@ contract DeployV is Script {
         );
         stdImpl = _deploy(
             sStd,
-            abi.encodePacked(type(GhostEscrowV2CImpl).creationCode, abi.encode(pFac, registry, cfg.highValueThreshold)),
+            abi.encodePacked(type(GhostEscrowV2CImpl).creationCode, abi.encode(pFac, registry, cfg.highValueThreshold, uint256(100), uint256(5e6), uint256(1), uint256(1e5))),
             c3.predict(ops, sStd)
         );
         openImpl = _deploy(
             sOpen,
-            abi.encodePacked(type(GhostEscrowV2OpenCImpl).creationCode, abi.encode(pFac, registry, cfg.highValueThreshold)),
+            abi.encodePacked(type(GhostEscrowV2OpenCImpl).creationCode, abi.encode(pFac, registry, cfg.highValueThreshold, uint256(100), uint256(5e6), uint256(1), uint256(1e5))),
             c3.predict(ops, sOpen)
         );
 

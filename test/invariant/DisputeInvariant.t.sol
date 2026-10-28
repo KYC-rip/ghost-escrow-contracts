@@ -26,8 +26,6 @@ contract DisputeHandler is Test {
     uint256 internal immutable chainId;
 
     bytes32 private constant RELEASE_TYPEHASH = keccak256("Release(uint256 nonce,uint256 deadline)");
-    bytes32 private constant REPLACE_ARB_TYPEHASH =
-        keccak256("ReplaceArbitrator(address newArbitrator,uint256 nonce,uint256 deadline)");
     address[6] public arbs; // for unbond/withdraw churn
 
     constructor(
@@ -170,15 +168,17 @@ contract DisputeHandler is Test {
         vm.roll(block.number + 10);
     }
 
-    function replaceArb(uint256 seed) external {
+    /// v5: the random arbitrator draw (replaces the removed mutual replaceArbitrator action).
+    function drawArb(uint256 seed) external {
         GhostEscrowV2CImpl e = _deal(seed);
-        address newArb = arbs[seed % 6];
-        uint256 deadline = block.timestamp + 1 hours;
-        bytes32 structHash = keccak256(abi.encode(REPLACE_ARB_TYPEHASH, newArb, e.nonce(), deadline));
-        bytes32 digest = SigUtils.digest(address(e), chainId, structHash);
-        (uint8 v1, bytes32 r1, bytes32 s1) = vm.sign(buyerPk, digest);
-        (uint8 v2, bytes32 r2, bytes32 s2) = vm.sign(sellerPk, digest);
-        try e.replaceArbitrator(newArb, deadline, abi.encodePacked(r1, s1, v1), abi.encodePacked(r2, s2, v2)) {} catch {}
+        vm.roll(block.number + (seed % 300) + 5); // sometimes inside, sometimes past the 256-block horizon
+        try e.drawArbitrator() {} catch {}
+    }
+
+    /// v5: the 14-day "nobody could decide" split.
+    function stalemate(uint256 seed) external {
+        vm.prank(_party(seed));
+        try _deal(seed).stalemateSplit() {} catch {}
     }
 
     function claimPot(uint256 seed) external {
@@ -233,7 +233,7 @@ contract DisputeInvariantTest is GhostTestBaseD {
         dealArr[3] = GhostEscrowV2CImpl(
             factory.createDeal(
                 address(stdImpl),
-                abi.encode(address(token), buyer, seller, arb, HV_AMOUNT, ARB_FEE, DEPOSIT_TIMEOUT, AUTO_RELEASE),
+                abi.encode(address(token), buyer, seller, address(0), HV_AMOUNT, uint256(0), DEPOSIT_TIMEOUT, AUTO_RELEASE),
                 bytes32(uint256(0xD15D + 3))
             )
         );
@@ -261,7 +261,10 @@ contract DisputeInvariantTest is GhostTestBaseD {
         assertEq(uint256(dealArr[0].state()), uint256(GhostEscrowV2CImpl.State.Active));
         handler.dispute(0);
         (bool assigned,,,,) = registry.assignmentOf(address(dealArr[0]));
-        assertTrue(assigned, "sub-threshold dispute must assign");
+        assertFalse(assigned, "v5: no assignment until the random draw");
+        handler.drawArb(0); // rolls 5 blocks — inside the horizon
+        (assigned,,,,) = registry.assignmentOf(address(dealArr[0]));
+        assertTrue(assigned, "sub-threshold dispute assigns at the draw");
         invariant_openCasesExactlyBalanced();
         handler.warp(8 days);
         handler.slashTimeout(0);
@@ -308,7 +311,11 @@ contract DisputeInvariantTest is GhostTestBaseD {
             GhostEscrowV2CImpl e = dealArr[i];
             (bool assigned, address asgArb,,,) = registry.assignmentOf(address(e));
             if (!assigned) continue;
-            assertEq(uint256(e.state()), uint256(GhostEscrowV2CImpl.State.Disputed), "assignment outside Disputed");
+            // F1 (v5): the case stays open through the appeal window, so RuledPendingAppeal is legitimate too.
+            assertTrue(
+                e.state() == GhostEscrowV2CImpl.State.Disputed || e.state() == GhostEscrowV2CImpl.State.RuledPendingAppeal,
+                "assignment outside Disputed/RuledPendingAppeal"
+            );
             assertLt(e.dealAmount(), e.HIGH_VALUE_THRESHOLD(), "assignment on a panel-required deal");
             assertEq(e.arbitrator(), asgArb, "assignment names a replaced arb");
         }

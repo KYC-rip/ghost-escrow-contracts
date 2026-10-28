@@ -82,10 +82,10 @@ contract Create3VanityTest is Test {
             c3.deploy(sCourt, abi.encodePacked(type(AppealCourt).creationCode, abi.encode(registry)))
         );
         GhostEscrowV2CImpl stdImpl = GhostEscrowV2CImpl(
-            c3.deploy(sStd, abi.encodePacked(type(GhostEscrowV2CImpl).creationCode, abi.encode(aFac, registry, uint256(25_000e6))))
+            c3.deploy(sStd, abi.encodePacked(type(GhostEscrowV2CImpl).creationCode, abi.encode(aFac, registry, uint256(25_000e6), uint256(100), uint256(5e6), uint256(1), uint256(1e5))))
         );
         GhostEscrowV2OpenCImpl openImpl = GhostEscrowV2OpenCImpl(
-            c3.deploy(sOpen, abi.encodePacked(type(GhostEscrowV2OpenCImpl).creationCode, abi.encode(aFac, registry, uint256(25_000e6))))
+            c3.deploy(sOpen, abi.encodePacked(type(GhostEscrowV2OpenCImpl).creationCode, abi.encode(aFac, registry, uint256(25_000e6), uint256(100), uint256(5e6), uint256(1), uint256(1e5))))
         );
 
         // Step 1 continued: the ops EOA (registry.deployer) binds.
