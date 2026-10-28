@@ -231,6 +231,11 @@ contract GhostEscrowV2OpenCImpl is ReentrancyGuard, EIP712 {
         require(ARBITRATOR_REGISTRY.isEligible(_arbitrator, _dealAmount), "arb not eligible");
         require(ARBITRATOR_REGISTRY.court() != address(0), "no court");
 
+        // F6: bind the deal token to the registry's staking token (USDC). Keeps
+        // the stake gate (usdcStake * MULTIPLE >= dealAmount) decimal-consistent
+        // and removes the fee-on-transfer / cross-deal court-bond risk by
+        // construction — the court and eligibility math assume one known token.
+        require(_token == address(ARBITRATOR_REGISTRY.STAKING_TOKEN()), "token != staking token");
         token = IERC20(_token);
         buyer = _buyer;
         seller = _seller;
