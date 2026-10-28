@@ -115,7 +115,7 @@ contract DeployD is Script {
             '"activationDelay":', vm.toString(cfg.activationDelay),
             "}"
         );
-        vm.writeFile(string.concat(vm.projectRoot(), "/deployments-v3.json"), string.concat(head, tail));
-        console2.log("deployments-v3.json written");
+        vm.writeFile(string.concat(vm.projectRoot(), "/deployments-v5.json"), string.concat(head, tail));
+        console2.log("deployments-v5.json written");
     }
 }
