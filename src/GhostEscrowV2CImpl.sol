@@ -697,6 +697,7 @@ contract GhostEscrowV2CImpl is ReentrancyGuard, EIP712 {
     }
 
     /// @notice F3: collect a payout that couldn't be pushed (e.g. while the address was on a token blocklist).
+    ///         Settlement never depends on the recipient; this claim does (a still-blocked recipient waits).
     function withdrawOwed() external nonReentrant {
         uint256 amount = owed[msg.sender];
         require(amount > 0, "nothing owed");

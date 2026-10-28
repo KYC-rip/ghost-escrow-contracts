@@ -110,6 +110,8 @@ contract AppealCourt is ReentrancyGuard {
     event OwedWithdrawn(address indexed to, uint256 amount);
 
     /// v5 F3/R3: panel pay / bond refunds a recipient couldn't receive (token blocklist); pull via withdrawOwed.
+    /// Audit note: these balances sit OUTSIDE each escrow's solvency invariant — the court must always hold
+    /// sum(owed) of the staking token (it only ever credits owed from tokens it holds at that moment).
     mapping(address => uint256) public owed;
 
     constructor(ArbitratorRegistry _registry) {
@@ -390,6 +392,9 @@ contract AppealCourt is ReentrancyGuard {
             return; // first-ruling: clear only; escrow stays Disputed (stalemate / re-request paths)
         }
 
+        // D4: credit the tip BEFORE settling — the escrow only accrues tips while still open (they are funded out of
+        // the platform fee at settlement); after _settleUphold it is Completed and the tip would be dropped.
+        _tip(deal);
         // Appeal: original ruling stands (uphold). F5 (v5): the bond is ALWAYS refunded to the appellant here —
         // a drawn panel that reached no majority earns nothing (paying it the bond rewarded stalling).
         _settleUphold(deal, c);
@@ -399,7 +404,6 @@ contract AppealCourt is ReentrancyGuard {
         } else {
             emit AppealResolved(deal, Outcome.Uphold, 0, 0);
         }
-        _tip(deal); // D4
     }
 
     // ─── Views (targeted — the struct getter would be stack-too-deep) ────────

@@ -89,6 +89,7 @@ contract ArbitratorRegistry is ReentrancyGuard {
     mapping(address => Arbitrator) private _arbitrators;
     mapping(address => Tranche[]) private _tranches;
     /// v5 F3/R3: slash compensation a recipient couldn't receive (e.g. a token blocklist); pull via withdrawOwed.
+    /// Audit note: sum(owed) is held on top of sum(stake) — slashes move stake into owed, never mint it.
     mapping(address => uint256) public owed;
 
     /// @dev Enumerable append-only arbitrator set (C-1) for panel draws.

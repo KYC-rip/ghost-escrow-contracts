@@ -284,6 +284,43 @@ contract V5Test is GhostTestBaseD {
         assertGt(e.tipOwed(p3), 0, "court-made un-sticking call earns the tip");
     }
 
+    function test_tips_appealDismissCreditsCaller_beforeSettlement() public {
+        _stakeArbEligible();
+        GhostEscrowV2CImpl e = _deal(33);
+        _stakePanel(); // after the deal: only `arb` is drawable as arbitrator; the panel can still seat
+        _toDrawnAppeal(e);
+        vm.warp(block.timestamp + SLA_DURATION + 1); // panel never reached a majority
+        uint256 feeBefore = token.balanceOf(feeRecipient);
+        vm.prank(p3);
+        court.dismiss(address(e));
+        assertEq(uint256(e.state()), uint256(GhostEscrowV2CImpl.State.Completed));
+        uint256 tip = e.tipOwed(p3);
+        assertGt(tip, 0, "keeper paid for closing a stuck appeal");
+        uint256 fee = (AMOUNT * FEE_BPS) / 10_000;
+        assertEq(token.balanceOf(feeRecipient) - feeBefore, fee - e.tipsTotal(), "tip funded out of the fee");
+        vm.prank(p3);
+        e.claimTip();
+        assertEq(token.balanceOf(p3), tip);
+    }
+
+    function test_F3_blockedKeeperClaimWaits_settlementDoesNot() public {
+        _stakeArbEligible();
+        GhostEscrowV2CImpl e = _deal(34);
+        _openDisputeOnly(e);
+        vm.roll(e.drawBlock() + 1);
+        vm.prank(p1);
+        e.drawArbitrator();
+        MockERC20(address(token)).setBlocked(p1, true);
+        (uint256 dl, bytes memory b, bytes memory s) = _releaseSigs(e);
+        e.release(dl, b, s); // settles despite a blocked keeper
+        vm.prank(p1);
+        vm.expectRevert(bytes("blocked"));
+        e.claimTip(); // the keeper's own claim waits until they can receive
+        MockERC20(address(token)).setBlocked(p1, false);
+        vm.prank(p1);
+        e.claimTip();
+    }
+
     // ─── F1: arbitrator stays locked through the appeal window ─────────────
 
     function test_F1_noExitDuringAppealWindow_eligibilityCountsFreeStakeOnly() public {
