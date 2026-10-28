@@ -69,7 +69,7 @@ contract ArbitratorRegistryTest is GhostTestBaseV2 {
         // too early
         vm.warp(UNBONDING - 1);
         vm.prank(arb);
-        vm.expectRevert(bytes("too early"));
+        vm.expectRevert(bytes("nothing matured")); // v5: the tranche exists but hasn't matured
         registry.withdraw();
 
         // after the delay
@@ -83,7 +83,7 @@ contract ArbitratorRegistryTest is GhostTestBaseV2 {
     function test_withdraw_nothing_pending_reverts() public {
         _stake(arb, 1e6, "pk");
         vm.prank(arb);
-        vm.expectRevert(bytes("nothing pending"));
+        vm.expectRevert(bytes("nothing matured")); // v5: no tranche at all
         registry.withdraw();
     }
 

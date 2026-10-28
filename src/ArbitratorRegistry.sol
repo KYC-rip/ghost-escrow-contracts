@@ -70,12 +70,26 @@ contract ArbitratorRegistry is ReentrancyGuard {
 
     struct Arbitrator {
         uint256 stake; // USDC, base units
-        uint256 pendingUnbond; // amount requested for unbonding
-        uint256 pendingSince; // block.timestamp of the unbond request
+        uint256 pendingTotal; // v5 D5: sum of all open unbond tranches
+        uint256 stakedSinceBlock; // v5 R5/R9: block the stake went 0 -> >0 (0 = not staked)
         string chatPubkey; // for dispute-time CK encryption (Shamir rev 3)
     }
 
+    /// v5 D5: each withdrawal request is its own tranche with its own clock.
+    struct Tranche {
+        uint256 amount;
+        uint256 since;
+    }
+
+    /// Most open withdrawal tranches per arbitrator (bounds the withdraw loop).
+    uint256 public constant MAX_TRANCHES = 8;
+    /// v5 B: rejection-sampling tries before the bounded walk in drawEligible.
+    uint256 public constant DRAW_TRIES = 16;
+
     mapping(address => Arbitrator) private _arbitrators;
+    mapping(address => Tranche[]) private _tranches;
+    /// v5 F3/R3: slash compensation a recipient couldn't receive (e.g. a token blocklist); pull via withdrawOwed.
+    mapping(address => uint256) public owed;
 
     /// @dev Enumerable append-only arbitrator set (C-1) for panel draws.
     address[] private _arbList;
@@ -100,6 +114,8 @@ contract ArbitratorRegistry is ReentrancyGuard {
     event ChatPubkeyUpdated(address indexed arb, string chatPubkey);
     event UnbondRequested(address indexed arb, uint256 amount, uint256 since);
     event Unbonded(address indexed arb, uint256 amount);
+    event OwedCredited(address indexed to, uint256 amount);
+    event OwedWithdrawn(address indexed to, uint256 amount);
     event Assigned(address indexed deal, address indexed arb, address escrow);
     event Resolved(address indexed deal, address indexed arb);
     event Slashed(address indexed deal, address indexed arb, uint256 amount, address opener);
@@ -170,6 +186,8 @@ contract ArbitratorRegistry is ReentrancyGuard {
         if (a.stake == 0) {
             require(bytes(chatPubkey).length > 0, "no pubkey");
             a.chatPubkey = chatPubkey;
+            // R5: the draw admits only arbitrators staked strictly before a deal's creation block.
+            a.stakedSinceBlock = block.number;
             if (_arbIndex[msg.sender] == 0) {
                 _arbList.push(msg.sender);
                 _arbIndex[msg.sender] = _arbList.length;
@@ -276,8 +294,8 @@ contract ArbitratorRegistry is ReentrancyGuard {
         delete _assignments[deal];
         slashed[deal] = true;
 
-        if (_arbitrators[arb].stake == 0) _removeFromList(arb);
-        STAKING_TOKEN.safeTransfer(opener, slashedAmount);
+        if (_arbitrators[arb].stake == 0) _exit(arb);
+        _payOrOwe(opener, slashedAmount);
         emit Slashed(deal, arb, slashedAmount, opener);
     }
 
@@ -313,53 +331,132 @@ contract ArbitratorRegistry is ReentrancyGuard {
     function slashOnOverturn(address arb) external returns (uint256 amount) {
         require(msg.sender == court, "not court");
         amount = (_arbitrators[arb].stake * OVERTURN_SLASH_BPS) / 10000;
+        if (amount == 0) return 0; // F8: nothing at stake: no transfer
         _arbitrators[arb].stake -= amount;
-        if (_arbitrators[arb].stake == 0) _removeFromList(arb);
-        STAKING_TOKEN.safeTransfer(msg.sender, amount);
+        if (_arbitrators[arb].stake == 0) _exit(arb);
+        STAKING_TOKEN.safeTransfer(msg.sender, amount); // the court itself
         emit OverturnSlashed(arb, amount);
     }
 
     // ─── Unbonding (blocked while any case is open) ──────────────────────────
 
+    /// @notice v5 D5: queue a withdrawal tranche. After every open tranche the remaining stake must stay at
+    ///         least MIN_STAKE, or be exactly 0 (full exit) — F4: no sub-floor stubs in the draw list.
     function requestUnbond(uint256 amount) external {
         require(openCases[msg.sender] == 0, "open cases");
         Arbitrator storage a = _arbitrators[msg.sender];
-        require(amount > 0 && amount <= a.stake, "bad amount");
-        // F4: a PARTIAL exit may not leave a sub-floor stub in the draw list —
-        // that would let a sybil pay MIN_STAKE once, unbond to dust and keep a
-        // list slot forever. Leave at least the floor, or leave entirely.
-        // (An involuntary slash may still land below the floor — punishment
-        // shrinks the stake in place; it does not mint list slots.)
-        require(amount == a.stake || a.stake - amount >= MIN_STAKE, "leave min or all");
-        a.pendingUnbond = amount;
-        a.pendingSince = block.timestamp;
+        require(amount > 0 && a.pendingTotal + amount <= a.stake, "bad amount");
+        uint256 remaining = a.stake - a.pendingTotal - amount;
+        require(remaining == 0 || remaining >= MIN_STAKE, "leave min or all");
+        require(_tranches[msg.sender].length < MAX_TRANCHES, "too many tranches");
+        _tranches[msg.sender].push(Tranche({amount: amount, since: block.timestamp}));
+        a.pendingTotal += amount;
         emit UnbondRequested(msg.sender, amount, block.timestamp);
     }
 
+    /// @notice Pay every matured tranche (UNBONDING_DELAY passed) while no case is open. Each payout is capped
+    ///         to the current stake: a slash may legitimately have beaten the exit (C-REV-2).
     function withdraw() external nonReentrant {
         require(openCases[msg.sender] == 0, "open cases");
         Arbitrator storage a = _arbitrators[msg.sender];
-        require(a.pendingUnbond > 0, "nothing pending");
-        require(block.timestamp >= a.pendingSince + UNBONDING_DELAY, "too early");
-        // Cap to current stake: an overturn slash may have legitimately beaten the
-        // exit and reduced stake below the pending amount (C-REV-2). Without this
-        // `a.stake -= amount` would underflow-revert and strand the remaining stake.
-        uint256 amount = a.pendingUnbond;
-        if (amount > a.stake) amount = a.stake;
-        a.pendingUnbond = 0;
-        a.stake -= amount;
-        if (a.stake == 0) _removeFromList(msg.sender);
+        Tranche[] storage ts = _tranches[msg.sender];
+        uint256 paid;
+        uint256 removed;
+        uint256 i;
+        while (i < ts.length) {
+            if (block.timestamp < ts[i].since + UNBONDING_DELAY) {
+                i++;
+                continue;
+            }
+            uint256 amt = ts[i].amount;
+            a.pendingTotal -= amt;
+            uint256 pay = amt > a.stake ? a.stake : amt;
+            a.stake -= pay;
+            paid += pay;
+            ts[i] = ts[ts.length - 1]; // swap-pop; re-examine index i
+            ts.pop();
+            removed++;
+        }
+        require(removed > 0, "nothing matured");
+        if (a.stake == 0) _exit(msg.sender);
+        if (paid > 0) STAKING_TOKEN.safeTransfer(msg.sender, paid);
+        emit Unbonded(msg.sender, paid);
+    }
+
+    /// @dev Stake reached 0: leave the draw list and forget the staking block (a later stake starts fresh).
+    function _exit(address arb) internal {
+        _removeFromList(arb);
+        _arbitrators[arb].stakedSinceBlock = 0;
+    }
+
+    /// @dev F3/R3: never let a recipient's blocklist revert a slash; park it for withdrawOwed.
+    function _payOrOwe(address to, uint256 amount) internal {
+        if (amount == 0) return;
+        if (!STAKING_TOKEN.trySafeTransfer(to, amount)) {
+            owed[to] += amount;
+            emit OwedCredited(to, amount);
+        }
+    }
+
+    function withdrawOwed() external nonReentrant {
+        uint256 amount = owed[msg.sender];
+        require(amount > 0, "nothing owed");
+        owed[msg.sender] = 0;
         STAKING_TOKEN.safeTransfer(msg.sender, amount);
-        emit Unbonded(msg.sender, amount);
+        emit OwedWithdrawn(msg.sender, amount);
     }
 
     // ─── Views ───────────────────────────────────────────────────────────────
 
-    function isEligible(address arb, uint256 dealAmount) external view returns (bool) {
+    /// @notice F1: eligibility counts only stake NOT queued for withdrawal.
+    function isEligible(address arb, uint256 dealAmount) public view returns (bool) {
         if (dealAmount == 0) return true;
-        uint256 stk = _arbitrators[arb].stake;
-        if (stk == 0) return false;
-        return stk * STAKE_MULTIPLE >= dealAmount;
+        uint256 free = freeStakeOf(arb);
+        if (free == 0) return false;
+        return free * STAKE_MULTIPLE >= dealAmount;
+    }
+
+    function freeStakeOf(address arb) public view returns (uint256) {
+        Arbitrator storage a = _arbitrators[arb];
+        return a.stake > a.pendingTotal ? a.stake - a.pendingTotal : 0;
+    }
+
+    function stakedSinceBlockOf(address arb) external view returns (uint256) {
+        return _arbitrators[arb].stakedSinceBlock;
+    }
+
+    /// @notice v5 B: a uniformly random arbitrator eligible for a deal, or address(0). Eligible = free stake
+    ///         covers the deal, not a party, staked strictly before the deal's creation block (R5). Up to
+    ///         DRAW_TRIES rejection-sampling picks, then a bounded walk from the first pick (so a sparse pool still
+    ///         finds a candidate). The seed comes from a future blockhash fixed at dispute time (template).
+    function drawEligible(bytes32 seed, uint256 dealAmount, address buyer, address seller, uint256 createdAtBlock)
+        external
+        view
+        returns (address)
+    {
+        uint256 n = _arbList.length;
+        if (n == 0) return address(0);
+        for (uint256 i = 0; i < DRAW_TRIES; i++) {
+            address c = _arbList[uint256(keccak256(abi.encode(seed, i))) % n];
+            if (_drawable(c, dealAmount, buyer, seller, createdAtBlock)) return c;
+        }
+        uint256 start = uint256(keccak256(abi.encode(seed, DRAW_TRIES))) % n;
+        for (uint256 k = 0; k < n; k++) {
+            address c = _arbList[(start + k) % n];
+            if (_drawable(c, dealAmount, buyer, seller, createdAtBlock)) return c;
+        }
+        return address(0);
+    }
+
+    function _drawable(address c, uint256 dealAmount, address buyer, address seller, uint256 createdAtBlock)
+        internal
+        view
+        returns (bool)
+    {
+        if (c == buyer || c == seller) return false;
+        uint256 since = _arbitrators[c].stakedSinceBlock;
+        if (since == 0 || since >= createdAtBlock) return false;
+        return isEligible(c, dealAmount);
     }
 
     function stakeOf(address arb) external view returns (uint256) {
@@ -370,8 +467,22 @@ contract ArbitratorRegistry is ReentrancyGuard {
         return _arbitrators[arb].chatPubkey;
     }
 
-    function pendingUnbondOf(address arb) external view returns (uint256, uint256) {
-        return (_arbitrators[arb].pendingUnbond, _arbitrators[arb].pendingSince);
+    /// @notice Total queued for withdrawal and the oldest tranche's request time (v4-compatible shape).
+    function pendingUnbondOf(address arb) external view returns (uint256 total, uint256 oldestSince) {
+        Tranche[] storage ts = _tranches[arb];
+        for (uint256 i = 0; i < ts.length; i++) if (oldestSince == 0 || ts[i].since < oldestSince) oldestSince = ts[i].since;
+        return (_arbitrators[arb].pendingTotal, oldestSince);
+    }
+
+    /// @notice Every open withdrawal tranche (amount, request time). Order changes as tranches are paid.
+    function pendingTranches(address arb) external view returns (uint256[] memory amounts, uint256[] memory sinces) {
+        Tranche[] storage ts = _tranches[arb];
+        amounts = new uint256[](ts.length);
+        sinces = new uint256[](ts.length);
+        for (uint256 i = 0; i < ts.length; i++) {
+            amounts[i] = ts[i].amount;
+            sinces[i] = ts[i].since;
+        }
     }
 
     function assignmentOf(address deal)
