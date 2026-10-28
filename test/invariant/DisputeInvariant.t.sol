@@ -321,6 +321,20 @@ contract DisputeInvariantTest is GhostTestBaseD {
         }
     }
 
+    /// INV (v5): every deal can always pay what it owes — deal funds (incl. unclaimed keeper tips), the fee pot and
+    /// parked payouts (F3 owed) — whatever the fuzzer did (draws, re-arms, stalemates, slashes, appeals).
+    function invariant_dealSolvent() public view {
+        for (uint256 i = 0; i < 4; i++) {
+            GhostEscrowV2CImpl e = dealArr[i];
+            assertGe(
+                token.balanceOf(address(e)),
+                e.deposited() + e.arbitratorFeePot() + e.owedTotal(),
+                "deal holds less than it owes"
+            );
+            assertLe(e.tipsTotal(), (e.dealAmount() * e.platformFeeBps()) / 10_000, "tips exceed the platform fee");
+        }
+    }
+
     /// INV: the registry can always pay out every recorded stake — slashes move
     /// tokens out in the same breath they reduce the number.
     function invariant_registrySolvent() public view {
