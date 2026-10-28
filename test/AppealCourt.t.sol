@@ -455,11 +455,13 @@ contract AppealCourtTest is GhostTestBaseV2 {
         _panelVote(p1, AMOUNT, 0);
         assertEq(uint256(escrowV2.state()), uint256(GhostEscrowV2.State.RuledPendingAppeal));
 
-        // After the panel SLA, anyone can dismiss → UPHOLD (bond → panel).
+        // After the panel SLA, anyone can dismiss → UPHOLD. F5 (v5): a panel that reached no majority earns
+        // nothing — the bond goes back to the appellant (paying the panel rewarded stalling).
+        uint256 sellerBefore = token.balanceOf(seller);
         vm.warp(block.timestamp + registry.SLA_DURATION() + 1);
         court.dismiss(address(escrowV2));
         assertEq(uint256(escrowV2.state()), uint256(GhostEscrowV2.State.Completed));
-        uint256 third = BOND / 3;
-        assertEq(token.balanceOf(p1), third + (BOND - third * 3), "p1 bond share on dismiss");
+        assertEq(token.balanceOf(p1), 0, "no-majority panel member paid nothing");
+        assertGe(token.balanceOf(seller) - sellerBefore, BOND, "appellant bond refunded");
     }
 }

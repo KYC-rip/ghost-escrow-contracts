@@ -19,6 +19,8 @@ interface IEscrowCourtHooks {
     ) external;
     function settleAppealUphold() external;
     function settleAppealOverturn(uint256 buyerAmount, uint256 sellerAmount) external;
+    /// v5 D4: credit the keeper tip to whoever made a successful drawPanel / dismiss call.
+    function creditKeeperTip(address keeper) external;
 }
 
 /**
@@ -104,6 +106,11 @@ contract AppealCourt is ReentrancyGuard {
     event PanelVoted(address indexed deal, address member, uint256 buyerAmount, uint256 sellerAmount);
     event AppealResolved(address indexed deal, Outcome outcome, uint256 panelPayout, uint256 appellantRefund);
     event FirstRulingApplied(address indexed deal);
+    event OwedCredited(address indexed to, uint256 amount);
+    event OwedWithdrawn(address indexed to, uint256 amount);
+
+    /// v5 F3/R3: panel pay / bond refunds a recipient couldn't receive (token blocklist); pull via withdrawOwed.
+    mapping(address => uint256) public owed;
 
     constructor(ArbitratorRegistry _registry) {
         require(address(_registry) != address(0), "zero registry");
@@ -170,7 +177,7 @@ contract AppealCourt is ReentrancyGuard {
     /// @notice Permissionless draw: after drawBlock, seed from its blockhash
     ///         (unbiased, unknown at request time, within the 256-block
     ///         horizon). Missed the horizon → re-arm and return (anyone retries).
-    function drawPanel(address deal) external {
+    function drawPanel(address deal) external nonReentrant {
         Case storage c = cases[deal];
         require(c.active && !c.drawn, "not drawable");
         require(block.number > c.drawBlock, "too early");
@@ -189,6 +196,7 @@ contract AppealCourt is ReentrancyGuard {
         c.drawDeadline = block.timestamp + registry.SLA_DURATION();
         registry.onPanelSeated(panel, len); // F3: lock members' unbonding for the case
         emit PanelDrawn(deal, panel);
+        _tip(deal); // D4: a successful draw (never a re-arm) earns the tip
     }
 
     /// @dev Deterministic index-walk over the registry arb set: candidates have
@@ -217,7 +225,8 @@ contract AppealCourt is ReentrancyGuard {
     function _isCandidate(address deal, address cand, address excludeArb) internal view returns (bool) {
         if (cand == excludeArb) return false;
         if (cand == IEscrowCourtHooks(deal).buyer() || cand == IEscrowCourtHooks(deal).seller()) return false;
-        if (registry.stakeOf(cand) <= registry.stakeOf(excludeArb)) return false;
+        // F4 (v5): no "strictly more stake than the excluded arb" gate — it made the top-staked arbitrator's
+        // rulings unappealable (no panel could ever seat).
         return registry.isEligible(cand, IEscrowCourtHooks(deal).dealAmount());
     }
 
@@ -297,7 +306,7 @@ contract AppealCourt is ReentrancyGuard {
             _settleOverturn(deal, c, b, s); // slash (USDC → court) + escrow re-settles
             uint256 payout = c.slashedForPanel;
             if (payout > 0) _payPanel(c, STAKING_TOKEN, payout); // slash → panel (USDC)
-            if (c.bond > 0 && c.challenger != address(0)) dealToken.safeTransfer(c.challenger, c.bond); // bond refund (deal token)
+            if (c.bond > 0 && c.challenger != address(0)) _payOrOwe(dealToken, c.challenger, c.bond); // bond refund (deal token)
             emit AppealResolved(deal, Outcome.Overturn, payout, c.bond);
         }
     }
@@ -323,9 +332,33 @@ contract AppealCourt is ReentrancyGuard {
 
     function _payPanel(Case storage c, IERC20 tkn, uint256 amount) internal {
         uint256 third = amount / 3;
-        tkn.safeTransfer(c.panel[0], third + (amount - third * 3)); // dust to member[0]
-        if (c.panelLen > 1) tkn.safeTransfer(c.panel[1], third);
-        if (c.panelLen > 2) tkn.safeTransfer(c.panel[2], third);
+        _payOrOwe(tkn, c.panel[0], third + (amount - third * 3)); // dust to member[0]
+        if (c.panelLen > 1) _payOrOwe(tkn, c.panel[1], third);
+        if (c.panelLen > 2) _payOrOwe(tkn, c.panel[2], third);
+    }
+
+    /// @dev D4: best effort — a template without the hook (pre-v5) or a reverting tip must never block a
+    ///      panel draw or a dismissal.
+    function _tip(address deal) internal {
+        try IEscrowCourtHooks(deal).creditKeeperTip(msg.sender) {} catch {}
+    }
+
+    /// @dev F3/R3: a recipient's blocklist must never revert a settlement. Every token here is the registry's
+    ///      staking token (F6 binds deal tokens to it), so one owed map suffices.
+    function _payOrOwe(IERC20 tkn, address to, uint256 amount) internal {
+        if (amount == 0) return;
+        if (!tkn.trySafeTransfer(to, amount)) {
+            owed[to] += amount;
+            emit OwedCredited(to, amount);
+        }
+    }
+
+    function withdrawOwed() external nonReentrant {
+        uint256 amount = owed[msg.sender];
+        require(amount > 0, "nothing owed");
+        owed[msg.sender] = 0;
+        STAKING_TOKEN.safeTransfer(msg.sender, amount);
+        emit OwedWithdrawn(msg.sender, amount);
     }
 
     // ─── Timeout escapes (bounded liveness) ──────────────────────────────────
@@ -352,22 +385,21 @@ contract AppealCourt is ReentrancyGuard {
         c.active = false;
         _clearPanel(c); // F3: no-op when never drawn
 
-        if (!c.isAppeal) return; // first-ruling: clear only; escrow stays Disputed
+        if (!c.isAppeal) {
+            _tip(deal); // D4: un-sticking a dead first panel
+            return; // first-ruling: clear only; escrow stays Disputed (stalemate / re-request paths)
+        }
 
-        // Appeal: original ruling stands (uphold). Bond → drawn panel, else refund.
+        // Appeal: original ruling stands (uphold). F5 (v5): the bond is ALWAYS refunded to the appellant here —
+        // a drawn panel that reached no majority earns nothing (paying it the bond rewarded stalling).
         _settleUphold(deal, c);
-        if (c.bond > 0) {
-            IERC20 dealToken = IERC20(IEscrowCourtHooks(deal).token());
-            if (c.drawn) {
-                _payPanel(c, dealToken, c.bond); // panel earned it
-                emit AppealResolved(deal, Outcome.Uphold, c.bond, 0);
-            } else if (c.challenger != address(0)) {
-                dealToken.safeTransfer(c.challenger, c.bond); // no panel → refund appellant
-                emit AppealResolved(deal, Outcome.Uphold, 0, c.bond);
-            }
+        if (c.bond > 0 && c.challenger != address(0)) {
+            _payOrOwe(IERC20(IEscrowCourtHooks(deal).token()), c.challenger, c.bond);
+            emit AppealResolved(deal, Outcome.Uphold, 0, c.bond);
         } else {
             emit AppealResolved(deal, Outcome.Uphold, 0, 0);
         }
+        _tip(deal); // D4
     }
 
     // ─── Views (targeted — the struct getter would be stack-too-deep) ────────
@@ -402,6 +434,11 @@ contract AppealCourt is ReentrancyGuard {
     ///         valves (claimStrandedPot) check the court without the full struct.
     function isCaseActive(address deal) external view returns (bool) {
         return cases[deal].active;
+    }
+
+    /// @notice When the case was requested (v5: the app no longer has to estimate the not-drawn timeout).
+    function requestedAtOf(address deal) external view returns (uint256) {
+        return cases[deal].requestedAt;
     }
 
     // ─── Internal helpers ────────────────────────────────────────────────────
